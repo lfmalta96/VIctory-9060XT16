@@ -83,6 +83,68 @@ fn build(words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
     Ok(shader)
 }
 
+/// [`build`]'s lowering for a program of `stage` (compute or pixel), before
+/// any validation: what the tests of the translation's choices look at.
+fn lowered(words: &[u32], srv: (u8, u32), stage: HwStage) -> Result<lower::Lowered, ShaderError> {
+    let param = |root, user_data| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot: 0,
+    };
+    let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride,
+        dwords,
+        user_data: 0,
+        slot: 0,
+    };
+    let io = match stage {
+        HwStage::Ps => StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        _ => StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [1, 1, 1],
+        }),
+    };
+    let native = NativeProgram {
+        stage,
+        wave64: false,
+        vgprs: 32,
+        layout: vec![param(RootType::Table, 0), param(RootType::ResourceHeap, 1)],
+        used: vec![
+            range(ResourceType::Srv, 0, srv.0, srv.1),
+            range(ResourceType::Uav, 16, 4, 0),
+        ],
+        io,
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+}
+
 /// The table at s[2:3], its raw UAV's descriptor in s[20:23].
 const TABLE: &[u32] = &[
     0xBE82_0300, // s_mov_b32 s2, s0
@@ -404,6 +466,21 @@ fn the_record_count_through_a_handle_of_its_own() {
             assert_eq!(got[..2], [3, read], "{label}");
         }
     }
+}
+
+/// With `VICTORY_SIZE_OWN_HANDLE` on, a pixel shader asks a buffer's size
+/// through the handle it reads through, as before: a helper lane's first-lane
+/// read is undefined, so no `waveReadLaneFirst` may make its handle. The same
+/// program as a compute shader does take the size's own handle.
+#[test]
+fn a_pixel_shader_asks_the_size_without_a_first_lane_read() {
+    let words = [TABLE, COUNT, STORE].concat();
+    super::TEST_SIZE_OWN_HANDLE.set(Some(true));
+    let compute = lowered(&words, (4, 16), HwStage::Cs);
+    let pixel = lowered(&words, (4, 16), HwStage::Ps);
+    super::TEST_SIZE_OWN_HANDLE.set(None);
+    assert!(compute.expect("translates").wave_ops, "compute: the size's own handle");
+    assert!(!pixel.expect("translates").wave_ops, "pixel: no first-lane read");
 }
 
 /// With `VICTORY_SIZE_OWN_HANDLE` on, in the DXIL as written (after the
