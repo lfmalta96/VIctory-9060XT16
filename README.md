@@ -100,6 +100,10 @@ For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
 the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
 and `performance` selects 1920×1080. All three output 3840×2160. With
 `victory run` directly, set `VICTORY_FSR_4K` to the preset name.
+AMD's SDK offers FSR 4.1.2 for some cards only. Where it does not, the
+newest FSR 3.1 it offers is used in its place and the log says so; its
+picture differs from FSR 4's. Where it offers neither, the run stops
+before the title starts and names the versions that were offered.
 The log reports the provider at context creation and the actual input and
 output sizes at the first successful temporal dispatch. The title profile
 and PC FidelityFX bridge were ported from [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).
