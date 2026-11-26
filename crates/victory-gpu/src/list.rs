@@ -243,7 +243,7 @@ const IDLE_MOST_BYTES: u64 = 256 << 20;
 
 #[cfg(windows)]
 fn idle_most() -> usize {
-    if crate::residency::limited_host_ram() { 128 } else { 256 }
+    if crate::residency::limited_host_ram() { 320 } else { 512 }
 }
 
 /// Whether host lists that have run are used again (on by default;

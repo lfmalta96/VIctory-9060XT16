@@ -562,7 +562,7 @@ fn sweep() {
         send::trim();
         card_steps::trim();
         crate::shadow::trim_snapshots();
-        crate::list::trim_idle(32);
+        crate::list::trim_idle(256);
         crate::list::thin::trim_backs(16);
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));

@@ -37,8 +37,8 @@ if ($Safe) {
     $settings.VICTORY_PORT_CBV = '1'
     $settings.VICTORY_PORT_GUARD = '1'
     $settings.VICTORY_PORT_JOURNAL = '1'
-    # Offload >=64 KiB buffer comparisons to GPU and reserve one physical core (>=6 cores) for victory-submit.
-    $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
+    # Offload >=1 MiB buffer comparisons to GPU (64 KiB caused 410 tiny passes/frame) and reserve one physical core for victory-submit.
+    $settings.VICTORY_CARD_BUFFERS_MIN_MB = '1'
     $settings.VICTORY_LANE_CORE = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
