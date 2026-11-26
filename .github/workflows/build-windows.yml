@@ -1,14 +1,19 @@
-name: Build Windows Binaries
+name: Build Windows Release
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Draft release tag to upload binaries to"
+        required: false
+        default: "v0.0.1-alpha"
   push:
     branches:
       - a-publier
       - "perf/**"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: build-win-${{ github.ref }}
@@ -19,7 +24,7 @@ env:
 
 jobs:
   build:
-    name: Build victory.exe (MSVC)
+    name: Build victory.exe (MSVC) & upload to private draft release
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -28,21 +33,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build diag (with diagnostics & panel)
         run: cargo build --locked --profile diag -p victory --features diagnostics
-      - name: Build release
+      - name: Build release (Thin LTO)
         run: cargo build --locked --release -p victory
-      - name: Upload diag artifact
+      - name: Package zip archives
+        shell: pwsh
+        run: |
+          $tag = if ('${{ inputs.tag }}') { '${{ inputs.tag }}' } else { 'v0.0.1-alpha' }
+          New-Item -ItemType Directory -Force -Path dist/diag/target/diag, dist/diag/scripts, dist/release/target/release, dist/release/scripts | Out-Null
+          Copy-Item target/diag/victory.exe dist/diag/target/diag/victory.exe
+          Copy-Item scripts/play.ps1 dist/diag/scripts/play.ps1
+          Copy-Item victory.example.toml dist/diag/victory.example.toml
+          Compress-Archive -Path dist/diag/* -DestinationPath "dist/victory-$tag-diag-win64.zip" -Force
+
+          Copy-Item target/release/victory.exe dist/release/target/release/victory.exe
+          Copy-Item scripts/play.ps1 dist/release/scripts/play.ps1
+          Copy-Item victory.example.toml dist/release/victory.example.toml
+          Compress-Archive -Path dist/release/* -DestinationPath "dist/victory-$tag-release-win64.zip" -Force
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: victory-diag-win64
-          path: |
-            target/diag/victory.exe
-            scripts/play.ps1
+          name: victory-win64-zips
+          path: dist/*.zip
           if-no-files-found: error
-      - name: Upload release artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: victory-release-win64
-          path: |
-            target/release/victory.exe
-            scripts/play.ps1
-          if-no-files-found: error
+      - name: Upload to private draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = if ('${{ inputs.tag }}') { '${{ inputs.tag }}' } else { 'v0.0.1-alpha' }
+          $diag = "dist/victory-$tag-diag-win64.zip"
+          $rel = "dist/victory-$tag-release-win64.zip"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --draft --prerelease --target "${{ github.ref_name }}" --title "$tag (RDNA4 + 32GB Perf Base)" --notes "Draft privado para testes (Ryzen 5500 + 32GB + RX 9060 XT 16GB)." $diag $rel
+          } else {
+            gh release upload $tag $diag $rel --clobber
+          }
