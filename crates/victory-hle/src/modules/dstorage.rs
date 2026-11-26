@@ -1599,7 +1599,8 @@ fn into_destination(
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first, and until the
-        // bytes are there.
+        // bytes are there. Lazy physical pages must be committed before kernel writes.
+        super::xmem::ensure_lazy_committed(request.destination as usize, len);
         let writing = victory_gpu::kernel_writing(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.

@@ -10,6 +10,8 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::os::windows::io::AsRawHandle;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -398,6 +400,9 @@ struct Section {
     window: std::sync::OnceLock<usize>,
     /// A bit per page: committed, as far as [`Section::window`] asked.
     committed: Box<[std::sync::atomic::AtomicU64]>,
+    /// File backing for `VICTORY_FILE_PHYSICAL=1`: keeps the mapping alive
+    /// and is removed on drop.
+    backing: Option<(std::fs::File, PathBuf)>,
 }
 
 impl Section {
@@ -437,10 +442,13 @@ impl Section {
             if run == 0 {
                 continue; // another worker committed it meanwhile
             }
-            if !commit(base + page * PAGE, run * PAGE) {
-                return None;
-            }
-            for p in page..page + run {
+            let run_len = run * PAGE;
+            let file_backed = self.backing.is_some();
+            let committed_pages = match commit(base + page * PAGE, run_len, file_backed) {
+                Some(n) => n,
+                None => return None,
+            };
+            for p in page..page + committed_pages {
                 self.committed[p / 64].fetch_or(1 << (p % 64), Ordering::AcqRel);
             }
             page += run;
@@ -465,10 +473,12 @@ impl Section {
         if lean() && done() {
             return true;
         }
-        if !counted(Call::Commit, || commit(base, len)) {
+        let file_backed = self.backing.is_some();
+        let Some(committed_pages) = counted(Call::Commit, || commit(base, len, file_backed)) else {
             return false;
-        }
-        for p in pages {
+        };
+        for (i, p) in pages.enumerate() {
+            if i >= committed_pages { break; }
             let (word, bit) = bit(p);
             word.fetch_or(bit, Ordering::AcqRel);
         }
@@ -497,6 +507,10 @@ impl Drop for Section {
         victory_gpu::title_memory_section_gone(self.handle as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };
+        if let Some((file, path)) = self.backing.take() {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -651,44 +665,27 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
+    let Some((handle, backing)) = create_physical_section(size) else {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
         return 0;
-    }
+    };
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
+        file_backed = backing.is_some(),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    // For the GPU side's in-place census: file-backed mappings have storage.
+    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine() || backing.is_some());
     let section = Arc::new(Section {
         handle,
         pages: n,
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        backing,
     });
     let mut table = page_table_mut();
     let first = table.next_page;
@@ -714,6 +711,90 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// 16: the title keeps them as 21-bit `number >> 4` and rebuilds
 /// them with `<< 4` (128 GiB of pages at most).
 const FRAMES: usize = PAGE >> 12;
+
+/// `VICTORY_FILE_PHYSICAL=1`: back physical-page sections with a temporary file
+/// instead of pagefile commit. Off by default. File removed when section freed.
+fn file_physical_enabled() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_FILE_PHYSICAL").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// `VICTORY_LAZY_PHYSICAL=1`: commit mapped physical pages on first access.
+/// Off by default; VEH commits faulting 64 KiB pages.
+fn lazy_physical_enabled() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_LAZY_PHYSICAL").is_some_and(|v| v == "1"));
+    *ON
+}
+
+fn create_physical_section(size: usize) -> Option<(HANDLE, Option<(std::fs::File, PathBuf)>)> {
+    if file_physical_enabled() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::var_os("VICTORY_CACHE_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("LOCALAPPDATA")
+                    .map(|b| PathBuf::from(b).join("victory").join("cache"))
+            })
+            .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let path = dir.join(format!(
+                "victory-physical-{}-{}.bin",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            #[cfg(windows)]
+            let open = {
+                use std::os::windows::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .custom_flags(0x04000000 /* FILE_FLAG_DELETE_ON_CLOSE */)
+                    .share_mode(0x00000004 /* FILE_SHARE_DELETE */)
+                    .open(&path)
+            };
+            #[cfg(not(windows))]
+            let open = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path);
+            if let Ok(file) = open {
+                if file.set_len(size as u64).is_ok() {
+                    // SAFETY: `file` remains open in the returned tuple.
+                    let handle = unsafe {
+                        CreateFileMappingW(
+                            file.as_raw_handle() as HANDLE,
+                            std::ptr::null(),
+                            PAGE_READWRITE,
+                            (size as u64 >> 32) as u32,
+                            size as u32,
+                            std::ptr::null(),
+                        )
+                    };
+                    if !handle.is_null() {
+                        return Some((handle, Some((file, path))));
+                    }
+                }
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        tracing::warn!("VICTORY_FILE_PHYSICAL=1 requested but file-backed section failed; using pagefile");
+    }
+
+    // SAFETY: plain section creation.
+    let handle = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            (size as u64 >> 32) as u32,
+            size as u32,
+            std::ptr::null(),
+        )
+    };
+    (!handle.is_null()).then_some((handle, None))
+}
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
@@ -757,7 +838,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        if !commit(at.Value as usize, len) {
+        if commit(at.Value as usize, len, slice.section.backing.is_some()).is_none() {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }
@@ -1780,17 +1861,181 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
     true
 }
 
+const LAZY_PREFIX: usize = 64 * 1024 * 1024;
+
+#[repr(C)]
+struct ExceptionRecord {
+    exception_code: u32,
+    exception_flags: u32,
+    exception_record: *mut ExceptionRecord,
+    exception_address: *mut c_void,
+    number_parameters: u32,
+    exception_information: [usize; 15],
+}
+#[repr(C)]
+struct ExceptionPointers { exception_record: *mut ExceptionRecord, context_record: *mut c_void }
+unsafe extern "system" {
+    fn AddVectoredExceptionHandler(first: u32, handler: Option<unsafe extern "system" fn(*mut ExceptionPointers) -> i32>) -> *mut c_void;
+}
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+static LAZY: LazyLock<Mutex<BTreeMap<usize, usize>>> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static HAS_LAZY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VEH: LazyLock<bool> = LazyLock::new(|| unsafe { !AddVectoredExceptionHandler(1, Some(commit_on_demand)).is_null() });
+
+unsafe extern "system" fn commit_on_demand(info: *mut ExceptionPointers) -> i32 {
+    if info.is_null() { return 0; }
+    let record = unsafe { (*info).exception_record };
+    if record.is_null() { return 0; }
+    let record = unsafe { &*record };
+    if record.exception_code != STATUS_ACCESS_VIOLATION || record.number_parameters < 2 { return 0; }
+    let page = record.exception_information[1] & !(PAGE - 1);
+    if !lazy_has(page) { return 0; }
+    if !commit_fault_page(page) { return 0; }
+    EXCEPTION_CONTINUE_EXECUTION
+}
+
+fn lazy_has(page: usize) -> bool {
+    if !HAS_LAZY.load(Ordering::Relaxed) {
+        return false;
+    }
+    let ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+    ranges.range(..=page).next_back().is_some_and(|(start, end)| *start <= page && page < *end)
+}
+
+fn commit_fault_page(page: usize) -> bool {
+    // SAFETY: page is inside a registered reserved mapping view.
+    !unsafe { VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null()
+}
+
+/// Ensures lazy physical pages in `[base, base+len)` are committed.
+/// Kernel-mode writes (ReadFile, DirectStorage) do not trigger the user-mode VEH.
+pub(crate) fn ensure_lazy_committed(base: usize, len: usize) {
+    if len == 0 || !lazy_physical_enabled() {
+        return;
+    }
+    let start = base & !(PAGE - 1);
+    let end = base.saturating_add(len);
+    let mut page = start;
+    while page < end {
+        let range = {
+            let ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((&_rstart, &rend)) = ranges
+                .range(..=page)
+                .next_back()
+                .filter(|(s, e)| **s <= page && page < **e)
+            {
+                Some((page, rend.min(end)))
+            } else if let Some((&rstart, &rend)) = ranges.range(page + 1..end).next() {
+                Some((rstart, rend.min(end)))
+            } else {
+                None
+            }
+        };
+        let Some((rstart, rend)) = range else { break };
+        let len = rend.saturating_sub(rstart);
+        // SAFETY: range is inside a registered lazy reserved mapping view.
+        let ok = !unsafe { VirtualAlloc(rstart as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null();
+        if ok {
+            // Remove committed pages from lazy tracking to avoid repeated VEH work.
+            // Bitmaps in Section are not updated here; later commit/window paths
+            // self-heal because VirtualAlloc(MEM_COMMIT) is idempotent.
+            lazy_remove(rstart, len);
+            page = rend;
+        } else {
+            // Leave range registered so VEH or a later retry can handle it.
+            // Stop scanning to avoid a hot loop on persistent commit failure.
+            break;
+        }
+    }
+}
+
+fn register_lazy(base: usize, len: usize) -> bool {
+    if !*VEH {
+        tracing::warn!("VICTORY_LAZY_PHYSICAL=1 requested but VEH install failed; using eager commit");
+        return false;
+    }
+    let mut ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut start = base;
+    let mut end = base.saturating_add(len);
+    // Merge overlapping/adjacent ranges so lazy_has/ensure_lazy_committed stay simple.
+    loop {
+        let prev = ranges
+            .range(..=start.saturating_add(PAGE))
+            .next_back()
+            .filter(|(_, stop)| **stop >= start)
+            .map(|(&s, &e)| (s, e));
+        let Some((s, e)) = prev else { break };
+        ranges.remove(&s);
+        start = start.min(s);
+        end = end.max(e);
+    }
+    loop {
+        let next = ranges
+            .range(start..=end.saturating_add(PAGE))
+            .next()
+            .filter(|(s, _)| **s <= end.saturating_add(PAGE))
+            .map(|(&s, &e)| (s, e));
+        let Some((s, e)) = next else { break };
+        ranges.remove(&s);
+        start = start.min(s);
+        end = end.max(e);
+    }
+    ranges.insert(start, end);
+    HAS_LAZY.store(true, Ordering::Release);
+    true
+}
+
+fn lazy_remove(base: usize, len: usize) {
+    let mut ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+    let end = base + len;
+    let hit: Vec<(usize, usize)> = ranges
+        .range(..=base)
+        .next_back()
+        .filter(|(_, stop)| **stop > base)
+        .map(|(&start, &stop)| (start, stop))
+        .into_iter()
+        .chain(ranges.range(base + 1..end).map(|(&at, &stop)| (at, stop)))
+        .collect();
+    for (start, stop) in hit {
+        ranges.remove(&start);
+        if start < base { ranges.insert(start, base); }
+        if stop > end { ranges.insert(end, stop); }
+    }
+    HAS_LAZY.store(!ranges.is_empty(), Ordering::Release);
+}
+
 /// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+/// Returns committed page count on success.
+fn commit(base: usize, len: usize, file_backed: bool) -> Option<usize> {
+    let pages = len / PAGE;
+    if file_backed || on_wine() {
+        return Some(pages); // file-backed/whole-committed section
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
-        return true;
+        return Some(pages);
     }
-    commit_refused(len, "physical pages", std::io::Error::last_os_error());
-    false
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(ERROR_COMMITMENT_LIMIT as i32) {
+        tracing::warn!(len, %error, "committing physical pages failed");
+        return None;
+    }
+    if !lazy_physical_enabled() {
+        commit_refused(len, "physical pages", error);
+        return None;
+    }
+    let prefix = len.min(LAZY_PREFIX);
+    if prefix > 0 && unsafe { VirtualAlloc(base as *const c_void, prefix, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+        commit_refused(len, "physical pages", std::io::Error::last_os_error());
+        return None;
+    }
+    if !register_lazy(base, len) {
+        commit_refused(len, "physical pages", std::io::Error::last_os_error());
+        return None;
+    }
+    tracing::warn!(len, prefix, "VICTORY_LAZY_PHYSICAL=1: committed prefix and deferred remaining physical pages");
+    Some(prefix / PAGE)
 }
 
 /// Reports memory the host would not give: at the Windows commit limit to
@@ -1872,6 +2117,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             victory_gpu::title_memory_splitting(at, size);
         }
         victory_gpu::title_memory_unmapping(at, size);
+        lazy_remove(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         let gone = counted(Call::Unmap, || unsafe {
             UnmapViewOfFile2(
@@ -2664,6 +2910,22 @@ mod tests {
         assert!(busy_after(true, ms(15), ms(250)) && !busy_after(true, ms(12), ms(250)));
         // A window without a call, then one short one.
         assert!(!busy_after(true, ms(5), ms(4000)));
+    }
+
+    #[test]
+    fn lazy_range_tracking_splits_on_remove() {
+        let base = 0x7FFF_0000_0000usize;
+        let len = 4 * PAGE;
+        {
+            let mut ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+            ranges.insert(base, base + len);
+        }
+        lazy_remove(base + PAGE, PAGE);
+        let ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(ranges.get(&base), Some(&(base + PAGE)));
+        assert_eq!(ranges.get(&(base + 2 * PAGE)), Some(&(base + len)));
+        drop(ranges);
+        lazy_remove(base, len);
     }
 
     #[test]
