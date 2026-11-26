@@ -61,6 +61,8 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
             0
         } else if pressure {
             1
+        } else if crate::residency::limited_host_ram() {
+            limit.min(4)
         } else {
             limit
         };
@@ -79,6 +81,7 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
 /// frames, a tenth of a second while the title shows a loading screen at 30
 /// a second, with up to 18 submissions in the air.)
 const REST: u64 = 2500;
+const STAGING_REST: u64 = 250;
 
 fn now() -> u64 {
     crate::host::now_ms()
@@ -206,11 +209,16 @@ struct Pool<B> {
     /// No new block is asked for before this time after one was refused
     /// ([`Pool::grow`]).
     retry_growth_at: u64,
+    rest: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Self::with_rest(most, REST)
+    }
+
+    const fn with_rest(most: usize, rest: u64) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, rest }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -307,7 +315,7 @@ impl<B: Clone> Pool<B> {
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
-        self.resting.push_back((now + REST, piece));
+        self.resting.push_back((now + self.rest, piece));
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
@@ -357,7 +365,7 @@ struct Upload(ID3D12Resource, *mut u8);
 unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::with_rest(STAGING_KEPT, STAGING_REST));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -765,6 +773,18 @@ mod tests {
         pool.give(held, REST);
         pool.reclaim(2 * REST, 0, true);
         assert_eq!(pool.blocks(), 0);
+    }
+
+    #[test]
+    fn staging_pool_reuses_piece_after_staging_rest() {
+        let mut pool = Pool::with_rest(STAGING_KEPT, STAGING_REST);
+        let (first, _, again) = pool.take(4096, 512, 100, || Some(1)).unwrap();
+        assert!(!again);
+        pool.give(first, 100);
+        let (other, _, _) = pool.take(4096, 512, 100 + STAGING_REST - 1, || Some(2)).unwrap();
+        assert_ne!(other.start, first.start);
+        let (reused, _, again) = pool.take(4096, 512, 100 + STAGING_REST, || Some(3)).unwrap();
+        assert_eq!((reused.block, reused.start, again), (first.block, first.start, true));
     }
 
     #[test]

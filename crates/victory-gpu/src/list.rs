@@ -239,7 +239,12 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+const IDLE_MOST_BYTES: u64 = 256 << 20;
+
+#[cfg(windows)]
+fn idle_most() -> usize {
+    if crate::residency::limited_host_ram() { 128 } else { 256 }
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -267,6 +272,21 @@ fn fresh_list() -> Option<crate::host::HostList> {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn trim_idle(keep: usize) {
+    let mut dropped = Vec::new();
+    {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        while idle.0.len() > keep {
+            if let Some(item) = idle.0.pop() {
+                idle.1 -= item.1;
+                dropped.push(item);
+            }
+        }
+    }
+    drop(dropped);
+}
+
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
 /// what they held is let go, as before, and the host lists are reset and
@@ -276,11 +296,12 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
+    let max_idle = idle_most();
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || host.should_retire() || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= max_idle {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -288,7 +309,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < max_idle && idle.1 + bytes <= IDLE_MOST_BYTES {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
@@ -404,16 +425,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
-        // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = list.host.take() else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -476,17 +489,9 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
-        // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = (*list).host.take() else {
                 continue;
             };
             let uploads =
@@ -680,17 +685,23 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // (a submission takes the parts it runs).
     #[cfg(windows)]
     {
-        // SAFETY: the title passes one of our lists, and neither records
-        // into it nor submits it during its reset.
-        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        list.earlier.clear();
-        list.gate.clear();
+        let had_host = {
+            let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+            list.earlier.clear();
+            list.gate.clear();
+            let had = list.host.is_some();
+            if !had {
+                list.host = fresh_list();
+            }
+            had
+        };
+        with_state(this, |host, state| {
+            if had_host {
+                host.reset();
+            }
+            state.reset(pipeline);
+        });
     }
-    #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
-        state.reset(pipeline);
-    });
     crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
     let _ = this;
