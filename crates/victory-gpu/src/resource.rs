@@ -1226,8 +1226,9 @@ struct Hosted {
     /// When the host copy was last asked for (`crate::host::moment`),
     /// written under `made`'s lock.
     used: std::sync::atomic::AtomicU64,
-    /// The host refused to make it: not tried again.
-    refused: std::sync::atomic::AtomicBool,
+    /// The host refused to make it: not tried again before this
+    /// `crate::host::coarse_ms` (`u64::MAX`: for good; 0: not refused).
+    refused_until: std::sync::atomic::AtomicU64,
     /// Its host copy was let go as idle once.
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
@@ -1602,8 +1603,31 @@ pub(crate) fn host_waits(this: This) -> bool {
     }
     let r = resource(this);
     r.desc.dimension != BUFFER
-        && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
+        && !refused(r)
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+}
+
+/// How long a texture the card had no memory for waits before it is asked
+/// for again (as long as uploads wait, `crate::residency`).
+#[cfg(windows)]
+const RETRY_MS: u64 = 500;
+
+/// Whether the host refused `r`'s copy and is not asked again yet.
+#[cfg(windows)]
+fn refused(r: &Resource) -> bool {
+    crate::host::coarse_ms() < r.host.refused_until.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether title texture `this` has no host copy because the card had no
+/// memory for it, and will be asked again ([`RETRY_MS`]): a slot that shows
+/// it is not done with.
+#[cfg(windows)]
+pub(crate) fn retrying(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let until = resource(this).host.refused_until.load(std::sync::atomic::Ordering::Relaxed);
+    until != 0 && until != u64::MAX
 }
 
 /// The host side of title texture `this`: made now if it is not there and
@@ -1617,9 +1641,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     if made.is_none() {
-        if !make || r.host.refused.load(Relaxed) {
+        if !make || refused(r) {
             return None;
         }
+        let _ = crate::residency::take_out_of_memory();
         let clear = r
             .host
             .clear
@@ -1687,9 +1712,18 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
+            // Out of memory: asked again once the card may have room (it was
+            // refused for good, and stayed without a host copy, avatarmanz/VIctory-7900XTX#256); any
+            // other refusal is for good.
+            let until = if crate::residency::take_out_of_memory() {
+                crate::host::coarse_ms().saturating_add(RETRY_MS)
+            } else {
+                u64::MAX
+            };
+            r.host.refused_until.store(until, Relaxed);
             return None;
         };
+        r.host.refused_until.store(0, Relaxed);
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
         // the one target dumps and the captured frame's list of commands
@@ -2518,6 +2552,12 @@ fn host_texture(
     host_texture_as(desc, state, clear, false)
 }
 
+#[cfg(all(windows, test))]
+thread_local! {
+    /// The error the next texture [`host_texture_as`] makes fails with.
+    static FAIL_NEXT: std::cell::Cell<Option<windows::core::HRESULT>> = const { std::cell::Cell::new(None) };
+}
+
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
 /// tiles level by level (`crate::tiles`).
 #[cfg(windows)]
@@ -2634,6 +2674,14 @@ fn host_texture_as(
             )
         }
     };
+    #[cfg(test)]
+    let made = match FAIL_NEXT.take() {
+        Some(code) => {
+            texture = None;
+            Err(code.into())
+        }
+        None => made,
+    };
     if let Err(e) = &made {
         crate::residency::allocation_error(e);
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
@@ -2643,6 +2691,7 @@ fn host_texture_as(
         && let Some(t) = &texture
         && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
     {
+        crate::residency::allocation_error(&e);
         tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
         texture = None;
     }
@@ -2790,7 +2839,7 @@ fn hand_out_resource(
             // then color or depth and stencil: 5 words) or null.
             clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
             used: std::sync::atomic::AtomicU64::new(0),
-            refused: std::sync::atomic::AtomicBool::new(false),
+            refused_until: std::sync::atomic::AtomicU64::new(0),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -3700,6 +3749,38 @@ mod tests {
             assert_eq!(sizes, [64, 32, 64, 32, 16, 8, 16, 8], "format {format}");
             assert_eq!(total, 24_072, "format {format}");
             assert!(subresource(&desc, 8).is_none(), "format {format}");
+        }
+    }
+
+    /// A texture the card had no memory for is made once the wait is over
+    /// (avatarmanz/VIctory-7900XTX#256); one the host refused for another reason stays refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_refused_for_want_of_memory_is_made_later() {
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+        if crate::host::host().is_none() || !lazy() {
+            return; // no host GPU here, or host copies made at creation
+        }
+        let null = std::ptr::null();
+        for (error, again) in [(E_OUTOFMEMORY, true), (E_INVALIDARG, false)] {
+            // A render target: made on its own, not cut from a block.
+            let mut desc = texture(4, 4, 28, 1);
+            desc.flags = 1;
+            let mut image = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 4, null.cast(), &RESOURCE_IIDS[0], &mut image),
+                S_OK
+            );
+            FAIL_NEXT.set(Some(error));
+            assert!(hosted(image, true).is_none(), "{error:?}");
+            assert_eq!(FAIL_NEXT.get(), None, "the failure was not injected");
+            assert_eq!(retrying(image), again, "{error:?}");
+            // Not asked again before its time.
+            assert!(hosted(image, true).is_none(), "{error:?}");
+            std::thread::sleep(std::time::Duration::from_millis(RETRY_MS + 100));
+            assert_eq!(hosted(image, true).is_some(), again, "{error:?}");
+            assert!(!retrying(image), "{error:?}");
+            assert_eq!(slot::<Release>(image, 0x10)(image), 0);
         }
     }
 

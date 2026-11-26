@@ -40,11 +40,19 @@ static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn allocation_error(error: &windows::core::Error) {
     if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
         RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(500), Ordering::Relaxed);
+        OUT_OF_MEMORY.set(true);
     }
 }
 
 thread_local! {
     static STAGING_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static OUT_OF_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread was refused memory ([`allocation_error`]) since the
+/// last call.
+pub(crate) fn take_out_of_memory() -> bool {
+    OUT_OF_MEMORY.replace(false)
 }
 
 pub(crate) fn note_staging_deferred() {
