@@ -2924,7 +2924,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECT, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -2933,16 +2933,31 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Reflect => REFLECT,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Reflect => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
+        if role == Role::Reflect {
+            // (Float RGB: R32G32B32A32, R16G16B16A16, R11G11B10.)
+            let float = matches!(of.Format.0, 2 | 10 | 26);
+            once!(format = of.Format.0, width = of.Width, height = of.Height, float, "missed reflection rays' image");
+            if !float || of.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+                return false;
+            }
+            return crate::ambient::after(list, role, &Views {
+                image,
+                depth,
+                size: [of.Width as u32, of.Height],
+                slices: 1,
+            });
+        }
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if role == Role::Resolve { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
@@ -4221,6 +4236,16 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            // The missed reflection rays' program runs only indirectly (its
+            // count comes from the ray binning), so its stand-in follows here;
+            // the other roles keep to the direct dispatches they were made at.
+            if let Some(role @ crate::ambient::Role::Reflect) = p.stages.first().and_then(|s| s.shader.ambient)
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
