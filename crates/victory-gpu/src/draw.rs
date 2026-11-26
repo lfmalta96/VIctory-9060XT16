@@ -731,6 +731,20 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
+/// Whether a texture found changed after its upload with nothing to tell
+/// of it is kept live: looked at every frame, fingerprinted whole
+/// (`VICTORY_LIVE_TEXTURES=0`: backs off along [`RECHECK_FRAMES`] as
+/// before). A TV's news video showed a colour ghost of an earlier frame:
+/// its luma and chroma planes each waited 12-44 frames on their own count.
+fn live_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIVE_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// Unchanged looks in a row after which a live slot goes back to the plain
+/// looks: some seconds at the world's frame rate.
+const LIVE_LOOKS: u8 = 120;
+
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
@@ -2459,15 +2473,29 @@ impl State {
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
             let mut changed_in_place = false;
-            if let Some(mut checked) = host.texture_slot_checked(index, write) {
+            // A slot found changed after its upload stays live (looked at
+            // every frame, fingerprinted whole) across its uploads again.
+            let mut live = false;
+            if let Some((mut checked, was_live)) = host.texture_slot_checked(index, write) {
                 let TextureRecheck { address: at, bytes: len, fingerprint, unchanged_looks, uploaded, .. } =
                     checked;
-                if crate::texture::fingerprint(at, len) == fingerprint {
+                if crate::texture::fingerprint_for(at, len, was_live) == fingerprint {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    if was_live {
+                        if unchanged_looks < LIVE_LOOKS {
+                            checked.unchanged_looks = unchanged_looks + 1;
+                            host.texture_slot_recheck(index, write, frame + 1, checked, true);
+                        } else {
+                            checked.fingerprint = crate::texture::fingerprint(at, len);
+                            checked.unchanged_looks = 1;
+                            host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[1], checked, false);
+                        }
+                        continue;
+                    }
                     match next_texture_recheck(unchanged_looks, checked.changed_in_place) {
                         Some((looks, wait)) => {
                             checked.unchanged_looks = looks;
-                            host.texture_slot_recheck(index, write, frame + wait, checked);
+                            host.texture_slot_recheck(index, write, frame + wait, checked, false);
                         }
                         None => host.texture_slot_done(index, write, None),
                     }
@@ -2477,6 +2505,7 @@ impl State {
                 if recheck_soon() {
                     again_in = 1;
                 }
+                live = live_textures();
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
@@ -2507,11 +2536,12 @@ impl State {
                     TextureRecheck {
                         address,
                         bytes,
-                        fingerprint: crate::texture::fingerprint(address, bytes),
+                        fingerprint: crate::texture::fingerprint_for(address, bytes, live),
                         unchanged_looks: 0,
                         uploaded: frame,
                         changed_in_place,
                     },
+                    live,
                 );
             };
             let mut partly = None;
