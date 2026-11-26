@@ -22,8 +22,9 @@ or publisher.
 
 ## Where it stands (2026-11-26)
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, ray tracing off.
+The measurements below come from one Windows 11 PC with an Intel i9-12900K,
+64 GB of system RAM and a Radeon RX 7900 XTX (24 GB of dedicated video memory).
+Ray tracing was off for these runs.
 
 | | |
 |---|---|
@@ -38,6 +39,18 @@ RX 7900 XTX, ray tracing off.
 It started at 280 ms a frame in the same scenes three days earlier. What sets
 the frame now is the one thread that submits the title's work to the card
 (about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
+
+### Reports from other GPUs
+
+| GPU and build | What the contributor observed |
+|---|---|
+| Radeon RX 9060 XT (16 GB), `cd8dfc0` with local changes | In the same Series X interior at 1080p, the game averaged 19.8 fps with ray tracing off and 15.6 fps with it on. Indirect lighting showed white patches and dark smears. [Run settings and results](https://github.com/Belobug/VIctory-Belobug-AMD/issues/313) |
+| GeForce RTX 3090 (24 GB), `a-publier@cd8dfc0` | The prison rendered. Two warm Series S runs averaged 545 and 532 ms per frame. The contributor reported 10.0 and 10.2 GB of VRAM in those runs. [Run settings and results](https://github.com/Belobug/VIctory-Belobug-AMD/issues/333) |
+| Intel Arc B580 (12 GB), revision unreported | Startup and initial menu navigation worked. Further menu interaction slowed to about 0.7 fps before D3D12 device removal. [Crash report](https://github.com/Belobug/VIctory-Belobug-AMD/issues/98) |
+
+The 10.5 GB of VRAM in the RX 7900 XTX table is the usage reported for that run.
+Memory use and frame time depend on the scene and settings. The [ray-tracing notes](docs/fork-ray-tracing.md)
+describe which lighting paths run and the remaining rendering issues.
 
 ### Renderer patches (off by default while they are tested)
 
@@ -58,6 +71,7 @@ the frame now is the one thread that submits the title's work to the card
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
+| `VICTORY_KBM_GTA=1` | Optional GTA V PC-style keyboard and mouse mapping on the stand-in pad: `F2` or `` ` `` (`~`) toggles mouse-look and auto-hides the cursor while locked (`Esc`/`P`/focus loss unlocks and restores it), LMB/RMB = RT/LT, MMB/`C` = R3, `Shift` = A, `Space` = X, `R` = B, `F` = Y, `Tab` = LB, `Q` = RB, `Ctrl` = L3, `E` = D-pad Right, `V` = View. Tune with `VICTORY_MOUSE_SENS` (default `1.0`) and `VICTORY_MOUSE_INVERT_Y=1` (or pass via `scripts\play.ps1 -More @{VICTORY_KBM_GTA='1'}`) |
 
 What is known to be wrong:
 

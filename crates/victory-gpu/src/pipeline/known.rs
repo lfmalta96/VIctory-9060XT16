@@ -35,6 +35,8 @@ mod writer;
 
 const SHADERS: &str = "known-shaders.bin";
 const PIPELINES: &str = "known-pipelines.bin";
+/// Compiler crashes and hangs recorded by `victory warm` and the runtime guard.
+pub const WARM_BAD_FILE: &str = "warm-bad.txt";
 /// Stages by their number in the files.
 const STAGES: [&str; 8] =
     ["vertex", "pixel", "domain", "hull", "geometry", "compute", "amplification", "mesh"];
@@ -266,10 +268,22 @@ fn is_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Formats a `warm-bad.txt` entry with the pipeline key in column one (so
+/// older binaries still quarantine the key) and a tagged fingerprint so
+/// driver or translator updates retry it automatically.
+pub fn format_bad_entry(key: &str, fingerprint: &str, reason: &str) -> String {
+    if reason.is_empty() {
+        format!("{key} fp={fingerprint}")
+    } else {
+        format!("{key} fp={fingerprint} {reason}")
+    }
+}
+
 /// Pipeline keys from `warm-bad.txt` that apply to `fingerprint`.
 ///
-/// Blank lines and `#` comments are ignored. Fingerprinted lines
-/// (`<16-hex-fingerprint> <32-hex-key> ...`) apply only when their
+/// Blank lines and `#` comments are ignored. Entries tagged with a
+/// fingerprint (`<key> fp=<16-hex-fingerprint> ...`, or
+/// `<16-hex-fingerprint> <32-hex-key> ...`) apply only when their
 /// fingerprint matches `fingerprint`, so a driver or translator update
 /// automatically retries them. Legacy or manually added bare-key lines
 /// (`<key> ...`) continue to apply regardless of fingerprint.
@@ -284,14 +298,21 @@ pub fn parse_bad_keys(text: &str, fingerprint: &str) -> HashSet<String> {
         let Some(first) = parts.next() else {
             continue;
         };
-        if is_hex(first, 16)
-            && let Some(second) = parts.next()
-            && is_hex(second, 32)
-        {
-            if first == fingerprint {
-                keys.insert(second.to_owned());
+        if let Some(second) = parts.next() {
+            if let Some(fp) = second.strip_prefix("fp=")
+                && is_hex(fp, 16)
+            {
+                if fp == fingerprint {
+                    keys.insert(first.to_owned());
+                }
+                continue;
             }
-            continue;
+            if is_hex(first, 16) && is_hex(second, 32) {
+                if first == fingerprint {
+                    keys.insert(second.to_owned());
+                }
+                continue;
+            }
         }
         keys.insert(first.to_owned());
     }
@@ -617,24 +638,43 @@ mod tests {
     fn bad_keys_expire_with_fingerprint_and_skip_comments() {
         let k_stale = "a".repeat(32);
         let k_warm = "b".repeat(32);
-        let k_guard = "c".repeat(32);
-        let k_legacy = "d".repeat(32);
+        let k_no_reason = "c".repeat(32);
+        let k_tab = "d".repeat(32);
+        let k_fp_first = "e".repeat(32);
+        let k_legacy = "f".repeat(32);
+        let k_bare = "1".repeat(32);
+        let k_bad_tag = "2".repeat(32);
+
+        let warm_line = format_bad_entry(&k_warm, "8899aabbccddeeff", "hung for 180 s");
+        assert_eq!(warm_line.split(' ').next(), Some(k_warm.as_str()));
+        let stale_line = format_bad_entry(&k_stale, "0011223344556677", "exit code: 0xc0000005");
+        let no_reason_line = format_bad_entry(&k_no_reason, "8899aabbccddeeff", "");
+        assert_eq!(no_reason_line, format!("{k_no_reason} fp=8899aabbccddeeff"));
+
         let text = format!(
             "\n   \n# comment\n   # indented comment\n\
-             0011223344556677 {k_stale} exit code: 0xc0000005\n\
-             8899aabbccddeeff {k_warm} hung for 180 s\n\
-             8899aabbccddeeff {k_guard} ended the compiler in a run: []\n\
+             {stale_line}\n\
+             {warm_line}\n\
+             {no_reason_line}\n\
+             \t{k_tab}\tfp=8899aabbccddeeff\tended the compiler\n\
+             8899aabbccddeeff {k_fp_first} legacy fp-first\n\
              {k_legacy} legacy crash\n\
-             manual-skip-key reason\n"
+             {k_bare}\n\
+             manual-skip-key reason\n\
+             {k_bad_tag} fp=nothex reason\n"
         );
 
         assert_eq!(
             parse_bad_keys(&text, "8899aabbccddeeff"),
             HashSet::from([
                 k_warm,
-                k_guard,
+                k_no_reason,
+                k_tab,
+                k_fp_first,
                 k_legacy.clone(),
+                k_bare.clone(),
                 "manual-skip-key".to_owned(),
+                k_bad_tag.clone(),
             ])
         );
         assert_eq!(
@@ -642,12 +682,19 @@ mod tests {
             HashSet::from([
                 k_stale,
                 k_legacy.clone(),
+                k_bare.clone(),
                 "manual-skip-key".to_owned(),
+                k_bad_tag.clone(),
             ])
         );
         assert_eq!(
             parse_bad_keys(&text, "ffffffffffffffff"),
-            HashSet::from([k_legacy, "manual-skip-key".to_owned()])
+            HashSet::from([
+                k_legacy,
+                k_bare,
+                "manual-skip-key".to_owned(),
+                k_bad_tag,
+            ])
         );
     }
 }

@@ -58,7 +58,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
     let fingerprint = known::fingerprint();
     let done_file = dir.join("warm-done.txt");
-    let bad_file = dir.join("warm-bad.txt");
+    let bad_file = dir.join(known::WARM_BAD_FILE);
     let keys = known::keys(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
     let mut done: HashSet<&str> = HashSet::new();
@@ -112,7 +112,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
-            let _ = writeln!(lock(&bad_out), "{fingerprint} {} {why}", keys[n]);
+            let _ = writeln!(lock(&bad_out), "{}", known::format_bad_entry(&keys[n], &fingerprint, &why));
             lock(&state).2 += 1;
         },
     )?;
@@ -385,10 +385,13 @@ mod tests {
         ];
         let done = HashSet::from([k_done.as_str()]);
         let early = HashSet::from([k_bad_current.as_str(), k_fresh.as_str()]);
+        let current_entry = known::format_bad_entry(&k_bad_current, "1111111111111111", "exit code: 0xc0000005");
+        assert_eq!(current_entry.split(' ').next(), Some(k_bad_current.as_str()));
+        let old_entry = known::format_bad_entry(&k_bad_old, "0000000000000000", "hung for 180 s");
         let bad_text = format!(
             "# comment\n\
-             1111111111111111 {k_bad_current} exit code: 0xc0000005\n\
-             0000000000000000 {k_bad_old} hung for 180 s\n\
+             {current_entry}\n\
+             {old_entry}\n\
              {k_legacy_bad} legacy crash\n"
         );
         let bad = known::parse_bad_keys(&bad_text, "1111111111111111");
