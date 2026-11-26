@@ -1,4 +1,4 @@
-//! Pipeline states. Both descriptions start as on PC: the root signature,
+﻿//! Pipeline states. Both descriptions start as on PC: the root signature,
 //! then the shader stages (five for graphics, one for compute); streams
 //! carry the rest of the graphics state as subobjects of the standard
 //! types.
@@ -786,6 +786,12 @@ pub(crate) fn library_removal_note() -> String {
     library::removal_note()
 }
 
+/// Report-only pipeline compile attribution: active, peak active, completed, total ms.
+#[cfg(windows)]
+pub fn compile_stats() -> [u64; 4] {
+    make::compile_stats()
+}
+
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
@@ -919,3 +925,5 @@ mod tests {
         }
     }
 }
+
+

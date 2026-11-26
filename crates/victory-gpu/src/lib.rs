@@ -1,4 +1,4 @@
-//! D3D12.X on host D3D12.
+﻿//! D3D12.X on host D3D12.
 //!
 //! D3D12.X records commands from code inlined into the title, which writes
 //! packets into the command list while its put pointer is below a limit and
@@ -112,6 +112,8 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use pipeline::compile_stats as pipeline_compile_stats;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
@@ -138,3 +140,6 @@ pub use watch::{
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+
+
