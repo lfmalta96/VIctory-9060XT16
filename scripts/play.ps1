@@ -7,7 +7,9 @@
 #               Light DRED is requested by default for diag and requires --features diagnostics.
 # -Console      series-x (default) or series-s (1080p profile, faster on 32 GB / mid-range GPUs)
 # -Panel        show the live on-screen performance panel (VICTORY_PANEL=1; F3 toggles it)
+# -SaveLog      save console output to victory-run-YYYYMMDD-HHMMSS.log in the Victory folder
 # -More         other settings: -More @{VICTORY_OUTPUT='1920x1080'}
+# Tip: press F9 in-game anytime to append a compact snapshot to victory-perf-snapshot.txt.
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -17,6 +19,7 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [switch]$Panel,
+    [switch]$SaveLog,
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -24,10 +27,20 @@ $settings = @{
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_RESIDENCY = '1'
+    # 32 GB RAM + RDNA4 switches: wait on residency only for textures (not plain buffers),
+    # track physical-RAM pressure (avoids system pagefile false triggers), and avoid blocking
+    # pipeline workers during library disk saves.
+    VICTORY_WAIT_RESIDENT = 'textures'
+    VICTORY_PRESSURE_PHYSICAL = '1'
+    VICTORY_LIBRARY_STORE_LATER = '1'
     # AMD's compiler makes the compute pipelines it crashed on (a buffer's size through a handle of its own).
     VICTORY_SIZE_OWN_HANDLE = '1'
 }
 if ($Build -eq 'diag') { $settings.VICTORY_D3D12_DRED = 'light' }
+if ($Console -eq 'series-s') {
+    # Removes stippled hair, foliage and fences on the Series S profile (#279).
+    $settings.VICTORY_UPSCALER = '6'
+}
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
@@ -37,7 +50,7 @@ if ($Safe) {
     $settings.VICTORY_PORT_CBV = '1'
     $settings.VICTORY_PORT_GUARD = '1'
     $settings.VICTORY_PORT_JOURNAL = '1'
-    # Offload >=1 MiB buffer comparisons to GPU (64 KiB caused 410 tiny passes/frame) and reserve one physical core for victory-submit.
+    # Offload >=1 MiB buffer comparisons to GPU and reserve one physical core (>=6 cores) for victory-submit.
     $settings.VICTORY_CARD_BUFFERS_MIN_MB = '1'
     $settings.VICTORY_LANE_CORE = '1'
 }
@@ -61,5 +74,15 @@ if ($discarded) {
     Write-Host "Discarded inherited values for $($discarded.Name -join ', '). Use -More to pass them explicitly."
 }
 $Exe = (Resolve-Path $Exe).Path
-Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute --console $Console } finally { Pop-Location }
+$root = Join-Path $PSScriptRoot '..'
+Push-Location $root   # victory.toml is looked for here
+try {
+    if ($SaveLog) {
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $logFile = Join-Path $root "victory-run-$stamp.log"
+        Write-Host "Saving full log to $logFile (press F9 in-game for instant perf snapshot; run scripts\extract-perf.ps1 after)"
+        & $victory run $Exe --execute --console $Console 2>&1 | Tee-Object -FilePath $logFile
+    } else {
+        & $victory run $Exe --execute --console $Console
+    }
+} finally { Pop-Location }

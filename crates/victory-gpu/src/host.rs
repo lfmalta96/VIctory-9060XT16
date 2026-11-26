@@ -621,6 +621,115 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    check_perf_snapshot_hotkey();
+}
+
+/// On-demand performance snapshot (press F9 in-game): appends a compact
+/// breakdown of residency waits, memory/VRAM, buffer pools, and active
+/// performance switches to `victory-perf-snapshot.txt` in the working folder.
+fn check_perf_snapshot_hotkey() {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F9};
+    static WAS_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // SAFETY: GetAsyncKeyState is a plain Win32 query.
+    let down = unsafe { GetAsyncKeyState(i32::from(VK_F9)) } & (1 << 15) != 0;
+    if !down || WAS_DOWN.swap(true, Ordering::Relaxed) {
+        if !down {
+            WAS_DOWN.store(false, Ordering::Relaxed);
+        }
+        return;
+    }
+    let frame = crate::frame::current();
+    let res_n = RESIDENT[0].load(Ordering::Relaxed);
+    let res_ms = RESIDENT[1].load(Ordering::Relaxed) as f64 / 1000.0;
+    let res_max = RESIDENT[2].load(Ordering::Relaxed) as f64 / 1000.0;
+    let map_n = MAPPED[0].load(Ordering::Relaxed);
+    let map_ms = MAPPED[1].load(Ordering::Relaxed) as f64 / 1000.0;
+    let map_max = MAPPED[2].load(Ordering::Relaxed) as f64 / 1000.0;
+    let vmem = host().and_then(|h| h.video_memory());
+    let mut mem: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    let has_mem = unsafe { GlobalMemoryStatusEx(&mut mem) } != 0;
+    let mut out = String::new();
+    use std::fmt::Write;
+    let _ = writeln!(out, "=== VICTORY PERF SNAPSHOT (frame={frame}, uptime_ms={}) ===", now_ms());
+    let _ = writeln!(
+        out,
+        "resident: count={res_n} total={res_ms:.1}ms max={res_max:.1}ms | mapped: count={map_n} total={map_ms:.1}ms max={map_max:.1}ms | buffers_wait={}",
+        wait_resident_buffers()
+    );
+    if let Some([budget, used, nl_budget, nl_used]) = vmem {
+        let _ = writeln!(
+            out,
+            "vram: local={:.2}/{:.2} GiB | shared={:.2}/{:.2} GiB",
+            used as f64 / (1u64 << 30) as f64,
+            budget as f64 / (1u64 << 30) as f64,
+            nl_used as f64 / (1u64 << 30) as f64,
+            nl_budget as f64 / (1u64 << 30) as f64,
+        );
+    }
+    if has_mem {
+        let total_ram = mem.ullTotalPhys as f64 / (1u64 << 30) as f64;
+        let used_ram = (mem.ullTotalPhys - mem.ullAvailPhys) as f64 / (1u64 << 30) as f64;
+        let used_cmt = (mem.ullTotalPageFile - mem.ullAvailPageFile) as f64 / (1u64 << 30) as f64;
+        let total_cmt = mem.ullTotalPageFile as f64 / (1u64 << 30) as f64;
+        let _ = writeln!(
+            out,
+            "ram: {used_ram:.2}/{total_ram:.2} GiB | commit: {used_cmt:.2}/{total_cmt:.2} GiB | pressured={}",
+            crate::residency::pressured()
+        );
+    }
+    let _ = writeln!(
+        out,
+        "alive: lists={} scratch_chunks={} ({} MiB) spare_chunks={} ({} MiB) list_uploads={} ({} MiB)",
+        ALIVE[0].load(Ordering::Relaxed),
+        ALIVE[1].load(Ordering::Relaxed),
+        ALIVE[2].load(Ordering::Relaxed) >> 20,
+        ALIVE[3].load(Ordering::Relaxed),
+        ALIVE[4].load(Ordering::Relaxed) >> 20,
+        ALIVE[6].load(Ordering::Relaxed),
+        ALIVE[7].load(Ordering::Relaxed) >> 20,
+    );
+    let _ = writeln!(
+        out,
+        "made: upload_bufs={} ({} MiB) shared_bufs={} ({} MiB) card_bufs={} ({} MiB)",
+        MADE[0].load(Ordering::Relaxed),
+        MADE[1].load(Ordering::Relaxed) >> 20,
+        MADE[2].load(Ordering::Relaxed),
+        MADE[3].load(Ordering::Relaxed) >> 20,
+        MADE[4].load(Ordering::Relaxed),
+        MADE[5].load(Ordering::Relaxed) >> 20,
+    );
+    let keys = [
+        "VICTORY_WAIT_RESIDENT",
+        "VICTORY_CARD_BUFFERS_MIN_MB",
+        "VICTORY_CARD_BUFFERS_MIN_KB",
+        "VICTORY_LANE_CORE",
+        "VICTORY_UPSCALER",
+        "VICTORY_RESIDENCY",
+        "VICTORY_PRESSURE_PHYSICAL",
+        "VICTORY_LIBRARY_STORE_LATER",
+        "VICTORY_PORT_CONSTANTS",
+        "VICTORY_PORT_DESCRIPTORS",
+        "VICTORY_PORT_CBV",
+        "VICTORY_PORT_GUARD",
+        "VICTORY_PORT_JOURNAL",
+    ];
+    let env_line: Vec<String> = keys
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| format!("{k}={v}")))
+        .collect();
+    let _ = writeln!(out, "switches: {}", env_line.join(" "));
+    let _ = writeln!(out);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("victory-perf-snapshot.txt")
+    {
+        use std::io::Write as _;
+        let _ = file.write_all(out.as_bytes());
+        tracing::info!("perf snapshot appended to victory-perf-snapshot.txt (F9)");
+    }
 }
 
 /// The number of the newest submission begun, and of the newest of which all

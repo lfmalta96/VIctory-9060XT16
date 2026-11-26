@@ -6,7 +6,7 @@ on:
       tag:
         description: "Draft release tag to upload binaries to"
         required: false
-        default: "v0.0.3-alpha"
+        default: "v0.0.4-alpha"
   push:
     branches:
       - a-publier
@@ -38,15 +38,17 @@ jobs:
       - name: Package zip archives
         shell: pwsh
         run: |
-          $tag = if ('${{ inputs.tag }}') { '${{ inputs.tag }}' } else { 'v0.0.3-alpha' }
+          $tag = if ('${{ inputs.tag }}') { '${{ inputs.tag }}' } else { 'v0.0.4-alpha' }
           New-Item -ItemType Directory -Force -Path dist/diag/target/diag, dist/diag/scripts, dist/release/target/release, dist/release/scripts | Out-Null
           Copy-Item target/diag/victory.exe dist/diag/target/diag/victory.exe
           Copy-Item scripts/play.ps1 dist/diag/scripts/play.ps1
+          Copy-Item scripts/extract-perf.ps1 dist/diag/scripts/extract-perf.ps1
           Copy-Item victory.example.toml dist/diag/victory.example.toml
           Compress-Archive -Path dist/diag/* -DestinationPath "dist/victory-$tag-diag-win64.zip" -Force
 
           Copy-Item target/release/victory.exe dist/release/target/release/victory.exe
           Copy-Item scripts/play.ps1 dist/release/scripts/play.ps1
+          Copy-Item scripts/extract-perf.ps1 dist/release/scripts/extract-perf.ps1
           Copy-Item victory.example.toml dist/release/victory.example.toml
           Compress-Archive -Path dist/release/* -DestinationPath "dist/victory-$tag-release-win64.zip" -Force
       - name: Upload workflow artifacts
@@ -60,7 +62,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = if ('${{ inputs.tag }}') { '${{ inputs.tag }}' } else { 'v0.0.3-alpha' }
+          $tag = if ('${{ inputs.tag }}') { '${{ inputs.tag }}' } else { 'v0.0.4-alpha' }
           $diag = "dist/victory-$tag-diag-win64.zip"
           $rel = "dist/victory-$tag-release-win64.zip"
           gh release view $tag 2>$null
