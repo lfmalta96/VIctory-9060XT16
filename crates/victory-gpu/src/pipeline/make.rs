@@ -517,7 +517,9 @@ fn slow_limit() -> usize {
         if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
             usize::MAX
         } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
+            let commit = available_commit_bytes();
+            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get()), commit) / 4)
+                .max(1)
         }
     })
 }
@@ -630,14 +632,46 @@ fn next(screens_only: bool) -> Arc<Pending> {
     }
 }
 
+/// Bytes left for Windows commit, or `u64::MAX` if unavailable.
+fn available_commit_bytes() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    if ok { m.ullAvailPageFile } else { u64::MAX }
+}
+
+/// Caps pipeline workers under low Windows commit headroom. Driver shader
+/// compiles can be memory-hungry; many concurrent compiles at 0 commit headroom
+/// caused LLVM/buffer-allocation OOM in monitored runs. Explicit
+/// `VICTORY_PIPELINE_WORKERS` is respected as a floor of 1 but still capped by
+/// severe commit pressure to avoid an immediate OOM.
+fn worker_count_for_commit(workers: usize, available_commit: u64) -> usize {
+    let mib = 1024 * 1024;
+    let cap = if available_commit < 512 * mib {
+        1
+    } else if available_commit < 1536 * mib {
+        2
+    } else if available_commit < 3072 * mib {
+        4
+    } else {
+        workers
+    };
+    workers.min(cap).max(1)
+}
+
 /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
 /// 64), else two thirds of the logical processors, 2 to 16. They run below the
-/// title's own threads, and a cold cache queues hundreds at once.
-fn worker_count(asked: Option<usize>, processors: usize) -> usize {
-    match asked {
+/// title's own threads, and a cold cache queues hundreds at once. Under low
+/// Windows commit headroom the count is reduced to avoid compile-time OOM.
+fn worker_count(asked: Option<usize>, processors: usize, available_commit: u64) -> usize {
+    let base = match asked {
         Some(n) => n.clamp(1, 64),
         None => (processors * 2 / 3).clamp(2, 16),
-    }
+    };
+    worker_count_for_commit(base, available_commit)
 }
 
 /// Starts the workers ([`worker_count`]) on first use.
@@ -645,13 +679,19 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
+        let available_commit = available_commit_bytes();
         let workers = worker_count(
             std::env::var("VICTORY_PIPELINE_WORKERS")
                 .ok()
                 .and_then(|v| v.trim().parse().ok()),
             std::thread::available_parallelism().map_or(2, |n| n.get()),
+            available_commit,
         );
-        tracing::info!(workers, "pipeline workers");
+        tracing::info!(
+            workers,
+            available_commit_mib = available_commit / (1024 * 1024),
+            "pipeline workers"
+        );
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         guard_start();
         for i in 0..workers + screens {
@@ -733,11 +773,23 @@ mod tests {
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
-        assert_eq!(worker_count(None, 1), 2);
-        assert_eq!(worker_count(None, 24), 16);
-        assert_eq!(worker_count(None, 64), 16);
-        assert_eq!(worker_count(Some(0), 24), 1);
-        assert_eq!(worker_count(Some(20), 24), 20);
+        let plenty = u64::MAX;
+        assert_eq!(worker_count(None, 1, plenty), 2);
+        assert_eq!(worker_count(None, 24, plenty), 16);
+        assert_eq!(worker_count(None, 64, plenty), 16);
+        assert_eq!(worker_count(Some(0), 24, plenty), 1);
+        assert_eq!(worker_count(Some(20), 24, plenty), 20);
+    }
+
+    #[test]
+    fn worker_count_is_capped_under_low_commit_headroom() {
+        let mib = 1024 * 1024;
+        assert_eq!(worker_count_for_commit(16, 256 * mib), 1);
+        assert_eq!(worker_count_for_commit(16, 1024 * mib), 2);
+        assert_eq!(worker_count_for_commit(16, 2048 * mib), 4);
+        assert_eq!(worker_count_for_commit(16, 4096 * mib), 16);
+        // Explicit ask is still bounded by severe pressure to avoid immediate OOM.
+        assert_eq!(worker_count(Some(8), 24, 256 * mib), 1);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
