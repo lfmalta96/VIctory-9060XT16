@@ -1,4 +1,4 @@
-﻿//! Host pipelines are made by workers, not by the title thread that first
+//! Host pipelines are made by workers, not by the title thread that first
 //! records a draw with them. Translating a shader and the host driver's
 //! compile take from milliseconds to seconds each (structurisation of the
 //! biggest compute programs ~0.4 s, some driver compiles 3.4 s), and
@@ -815,9 +815,10 @@ mod tests {
     fn compile_stats_are_report_only() {
         let before = compile_stats();
         assert!(before[1] >= before[0]);
+        let after = compile_stats();
         // Completed count and total ms are monotonic in normal operation.
-        assert!(before[2] <= u64::MAX);
-        assert!(before[3] <= u64::MAX);
+        assert!(after[2] >= before[2]);
+        assert!(after[3] >= before[3]);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the

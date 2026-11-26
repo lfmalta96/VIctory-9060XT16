@@ -5,7 +5,9 @@
 # -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance): FSR 4.1.2 where AMD's SDK offers it for the card, FSR 3.1 otherwise
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 #               Light DRED is requested by default for diag and requires --features diagnostics.
-# -More         other settings: -More @{VICTORY_PANEL='1'}
+# -Console      series-x (default) or series-s (1080p profile, faster on 32 GB / mid-range GPUs)
+# -Panel        show the live on-screen performance panel (VICTORY_PANEL=1; F3 toggles it)
+# -More         other settings: -More @{VICTORY_OUTPUT='1920x1080'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -13,13 +15,15 @@ param(
     [switch]$RayTracing,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
+    [switch]$Panel,
     [hashtable]$More = @{}
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'
+    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_RESIDENCY = '1'
     # AMD's compiler makes the compute pipelines it crashed on (a buffer's size through a handle of its own).
     VICTORY_SIZE_OWN_HANDLE = '1'
 }
@@ -28,9 +32,17 @@ if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
+    # Renderer patches 1, 2, 5, 6 and 7: direct constants heap, patched descriptor writes,
+    # in-place raw CBV reads, shared guard lock + parallel refresh planning, sharded journal.
+    $settings.VICTORY_PORT_CONSTANTS = '1'
+    $settings.VICTORY_PORT_DESCRIPTORS = '1'
+    $settings.VICTORY_PORT_CBV = '1'
+    $settings.VICTORY_PORT_GUARD = '1'
+    $settings.VICTORY_PORT_JOURNAL = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
+if ($Panel) { $settings.VICTORY_PANEL = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
@@ -49,4 +61,4 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+try { & $victory run $Exe --execute --console $Console } finally { Pop-Location }

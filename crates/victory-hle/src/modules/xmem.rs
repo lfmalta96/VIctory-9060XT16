@@ -444,10 +444,7 @@ impl Section {
             }
             let run_len = run * PAGE;
             let file_backed = self.backing.is_some();
-            let committed_pages = match commit(base + page * PAGE, run_len, file_backed) {
-                Some(n) => n,
-                None => return None,
-            };
+            let committed_pages = commit(base + page * PAGE, run_len, file_backed)?;
             for p in page..page + committed_pages {
                 self.committed[p / 64].fetch_or(1 << (p % 64), Ordering::AcqRel);
             }

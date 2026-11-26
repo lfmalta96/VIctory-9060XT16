@@ -1,0 +1,48 @@
+name: Build Windows Binaries
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - a-publier
+      - "perf/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-win-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build victory.exe (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build diag (with diagnostics & panel)
+        run: cargo build --locked --profile diag -p victory --features diagnostics
+      - name: Build release
+        run: cargo build --locked --release -p victory
+      - name: Upload diag artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: victory-diag-win64
+          path: |
+            target/diag/victory.exe
+            scripts/play.ps1
+          if-no-files-found: error
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: victory-release-win64
+          path: |
+            target/release/victory.exe
+            scripts/play.ps1
+          if-no-files-found: error
