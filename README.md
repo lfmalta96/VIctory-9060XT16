@@ -83,6 +83,11 @@ cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
+The launcher requests light device removal diagnostics (DRED) by default with
+`-Build diag`. DRED requires `--features diagnostics`. For a release binary
+built with that feature, request DRED with
+`-Build release -More @{VICTORY_D3D12_DRED='light'}`.
+
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
 
