@@ -257,6 +257,47 @@ pub fn fingerprint() -> String {
     h.finalize().to_hex()[..16].to_owned()
 }
 
+/// Whether `warm-bad.txt` is ignored (`VICTORY_WARM_BAD=0`).
+pub fn bad_list_disabled() -> bool {
+    std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0")
+}
+
+fn is_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Pipeline keys from `warm-bad.txt` that apply to `fingerprint`.
+///
+/// Blank lines and `#` comments are ignored. Fingerprinted lines
+/// (`<16-hex-fingerprint> <32-hex-key> ...`) apply only when their
+/// fingerprint matches `fingerprint`, so a driver or translator update
+/// automatically retries them. Legacy or manually added bare-key lines
+/// (`<key> ...`) continue to apply regardless of fingerprint.
+pub fn parse_bad_keys(text: &str, fingerprint: &str) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(first) = parts.next() else {
+            continue;
+        };
+        if is_hex(first, 16)
+            && let Some(second) = parts.next()
+            && is_hex(second, 32)
+        {
+            if first == fingerprint {
+                keys.insert(second.to_owned());
+            }
+            continue;
+        }
+        keys.insert(first.to_owned());
+    }
+    keys
+}
+
 /// The translations of earlier runs are in `dir` (the pipeline library is
 /// not used: what is made here is the driver's to keep).
 pub fn use_translations(dir: PathBuf) {
@@ -570,5 +611,43 @@ mod tests {
         assert_eq!(walk_shaders(&dir, |stage, hash, at, len| seen.push((stage, hash[0], at, len))), one);
         assert_eq!(seen, [(5, 9, 37, 4)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_keys_expire_with_fingerprint_and_skip_comments() {
+        let k_stale = "a".repeat(32);
+        let k_warm = "b".repeat(32);
+        let k_guard = "c".repeat(32);
+        let k_legacy = "d".repeat(32);
+        let text = format!(
+            "\n   \n# comment\n   # indented comment\n\
+             0011223344556677 {k_stale} exit code: 0xc0000005\n\
+             8899aabbccddeeff {k_warm} hung for 180 s\n\
+             8899aabbccddeeff {k_guard} ended the compiler in a run: []\n\
+             {k_legacy} legacy crash\n\
+             manual-skip-key reason\n"
+        );
+
+        assert_eq!(
+            parse_bad_keys(&text, "8899aabbccddeeff"),
+            HashSet::from([
+                k_warm,
+                k_guard,
+                k_legacy.clone(),
+                "manual-skip-key".to_owned(),
+            ])
+        );
+        assert_eq!(
+            parse_bad_keys(&text, "0011223344556677"),
+            HashSet::from([
+                k_stale,
+                k_legacy.clone(),
+                "manual-skip-key".to_owned(),
+            ])
+        );
+        assert_eq!(
+            parse_bad_keys(&text, "ffffffffffffffff"),
+            HashSet::from([k_legacy, "manual-skip-key".to_owned()])
+        );
     }
 }

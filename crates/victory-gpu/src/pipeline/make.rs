@@ -103,27 +103,26 @@ impl Pending {
 /// crashes on.
 static SKIPPED_BAD: AtomicU64 = AtomicU64::new(0);
 
-/// The keys of the pipelines the driver's compiler crashed on
-/// (`warm-bad.txt` beside the pipeline library, one key to a line, then
-/// anything; `#` begins a comment), loaded on first use. `VICTORY_WARM_BAD=0`
-/// leaves the file unread.
+/// The keys of the pipelines the driver's compiler crashed or hung on
+/// (`warm-bad.txt` beside the pipeline library). Recorded entries use
+/// `<fingerprint> <key> ...` so driver or translator changes retry them
+/// automatically; bare `<key> ...` lines remain compatible and `#` begins a
+/// comment. Loaded on first use; `VICTORY_WARM_BAD=0` leaves the file unread.
 static BAD_KEYS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
 
 fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
     let mut keys = BAD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
     let keys = keys.get_or_insert_with(|| {
-        if std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
+        if super::known::bad_list_disabled() {
             return Default::default();
         }
         let listed = super::library::folder()
             .and_then(|d| std::fs::read_to_string(d.join("warm-bad.txt")).ok())
             .unwrap_or_default();
-        listed
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .filter_map(|l| l.split_whitespace().next())
-            .map(str::to_owned)
-            .collect()
+        if listed.is_empty() {
+            return Default::default();
+        }
+        super::known::parse_bad_keys(&listed, &super::known::fingerprint())
     });
     f(keys)
 }
@@ -298,7 +297,8 @@ fn lost(slot: usize) {
         use std::io::Write;
         let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("warm-bad.txt"));
         if let Ok(mut f) = file {
-            let _ = writeln!(f, "{} ended the compiler in a run: {:?}", p.key, p.shaders);
+            let fingerprint = super::known::fingerprint();
+            let _ = writeln!(f, "{fingerprint} {} ended the compiler in a run: {:?}", p.key, p.shaders);
         }
     }
     let _ = p.made.set(None);
