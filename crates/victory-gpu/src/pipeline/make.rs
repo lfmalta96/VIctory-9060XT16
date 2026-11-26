@@ -1,4 +1,4 @@
-//! Host pipelines are made by workers, not by the title thread that first
+﻿//! Host pipelines are made by workers, not by the title thread that first
 //! records a draw with them. Translating a shader and the host driver's
 //! compile take from milliseconds to seconds each (structurisation of the
 //! biggest compute programs ~0.4 s, some driver compiles 3.4 s), and
@@ -723,11 +723,17 @@ fn spawn_worker(screens_only: bool) -> bool {
             }
             loop {
                 let p = next(screens_only);
+                let began = Instant::now();
                 {
                     // (If the compiler crashes in here this thread never
                     // returns: `lost` does what follows for it.)
                     let _compile = Compile::begin(slot, &p, screens_only);
+                    let active = COMPILE_STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
+                    COMPILE_STATS[1].fetch_max(active, Ordering::Relaxed);
                     p.make();
+                    COMPILE_STATS[0].fetch_sub(1, Ordering::Relaxed);
+                    COMPILE_STATS[2].fetch_add(1, Ordering::Relaxed);
+                    COMPILE_STATS[3].fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
                 }
                 if p.was_slow.load(Ordering::Relaxed) {
                     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
@@ -751,6 +757,19 @@ fn spawn_worker(screens_only: bool) -> bool {
 
 /// The most pipelines waiting at once since the workers last ran out.
 static PEAK: AtomicU64 = AtomicU64::new(0);
+/// Active shader/pipeline compiles and attribution (report-only): active,
+/// peak active, completed compiles, total compile milliseconds.
+static COMPILE_STATS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Report-only pipeline compile attribution: active, peak active, completed, total ms.
+pub(crate) fn compile_stats() -> [u64; 4] {
+    std::array::from_fn(|i| COMPILE_STATS[i].load(Ordering::Relaxed))
+}
 
 /// The workers ran out of work: logged after a batch of 10 or more, and
 /// the cache saved (at most every 20 s).
@@ -790,6 +809,15 @@ mod tests {
         assert_eq!(worker_count_for_commit(16, 4096 * mib), 16);
         // Explicit ask is still bounded by severe pressure to avoid immediate OOM.
         assert_eq!(worker_count(Some(8), 24, 256 * mib), 1);
+    }
+
+    #[test]
+    fn compile_stats_are_report_only() {
+        let before = compile_stats();
+        assert!(before[1] >= before[0]);
+        // Completed count and total ms are monotonic in normal operation.
+        assert!(before[2] <= u64::MAX);
+        assert!(before[3] <= u64::MAX);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
@@ -893,3 +921,6 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
     }
 }
+
+
+
