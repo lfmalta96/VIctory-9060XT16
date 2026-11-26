@@ -120,7 +120,13 @@ static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    if on_card() {
+        256 << 20
+    } else if crate::residency::limited_host_ram() {
+        192 << 20
+    } else {
+        512 << 20
+    }
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -167,6 +173,11 @@ pub(super) fn give_back(memory: Memory) {
     while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
         spare.remove(0);
     }
+}
+
+pub(super) fn trim() {
+    let dropped = std::mem::take(&mut *SPARE.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(dropped);
 }
 
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,

@@ -604,6 +604,16 @@ unsafe impl Send for Own {}
 
 /// Those that have landed: closed, their steps dropped.
 static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
+const POOL_MOST: usize = 16;
+
+pub(super) fn trim() {
+    let dropped: Vec<Own> = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let n = pool.len().saturating_sub(2);
+        pool.drain(..n).collect()
+    };
+    drop(dropped);
+}
 
 /// Since the last frame-rate line: fills and copies done on the card, their
 /// bytes, and submissions that waited instead, refused by a check.
@@ -642,7 +652,13 @@ impl Taken {
         // The host copies its steps held go; its commands stay until the
         // next use resets it.
         drop(std::mem::take(&mut *self.own.list.deferred()));
-        POOL.lock().unwrap_or_else(|e| e.into_inner()).push(self.own);
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() < POOL_MOST {
+            pool.push(self.own);
+        } else {
+            drop(pool);
+            drop(self.own);
+        }
     }
 }
 
