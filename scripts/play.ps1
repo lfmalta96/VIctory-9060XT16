@@ -32,13 +32,14 @@ if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
-    # Renderer patches 1, 2, 5, 6 and 7: direct constants heap, patched descriptor writes,
-    # in-place raw CBV reads, shared guard lock + parallel refresh planning, sharded journal.
+    # Renderer patches 1, 5, 6 and 7 (patch 2 / PORT_DESCRIPTORS left off: misses draw-table writers).
     $settings.VICTORY_PORT_CONSTANTS = '1'
-    $settings.VICTORY_PORT_DESCRIPTORS = '1'
     $settings.VICTORY_PORT_CBV = '1'
     $settings.VICTORY_PORT_GUARD = '1'
     $settings.VICTORY_PORT_JOURNAL = '1'
+    # Offload >=64 KiB buffer comparisons to GPU and reserve one physical core (>=6 cores) for victory-submit.
+    $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
+    $settings.VICTORY_LANE_CORE = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
