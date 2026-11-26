@@ -83,6 +83,68 @@ fn build(words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
     Ok(shader)
 }
 
+/// [`build`]'s lowering for a program of `stage` (compute or pixel), before
+/// any validation: what the tests of the translation's choices look at.
+fn lowered(words: &[u32], srv: (u8, u32), stage: HwStage) -> Result<lower::Lowered, ShaderError> {
+    let param = |root, user_data| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot: 0,
+    };
+    let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride,
+        dwords,
+        user_data: 0,
+        slot: 0,
+    };
+    let io = match stage {
+        HwStage::Ps => StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        _ => StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [1, 1, 1],
+        }),
+    };
+    let native = NativeProgram {
+        stage,
+        wave64: false,
+        vgprs: 32,
+        layout: vec![param(RootType::Table, 0), param(RootType::ResourceHeap, 1)],
+        used: vec![
+            range(ResourceType::Srv, 0, srv.0, srv.1),
+            range(ResourceType::Uav, 16, 4, 0),
+        ],
+        io,
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+}
+
 /// The table at s[2:3], its raw UAV's descriptor in s[20:23].
 const TABLE: &[u32] = &[
     0xBE82_0300, // s_mov_b32 s2, s0
@@ -368,4 +430,124 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
     for (label, got) in run(&shader, &views) {
         assert_eq!(got[..2], [0, 6], "{label}");
     }
+}
+
+/// As the two tests above, with `VICTORY_SIZE_OWN_HANDLE` on: the size is
+/// asked through a handle of its own, which AMD's compiler makes a pipeline
+/// of where one handle for the read and the size crashes it (RX 9070 XT), and
+/// the counts and the value read are the same.
+#[test]
+fn the_record_count_through_a_handle_of_its_own() {
+    let load = [
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xE030_2000, // buffer_load_dword v5, v3, s[8:11], 0 idxen
+        0x8002_0503,
+        0x7E0A_0505, // v_readfirstlane_b32 s5, v5
+    ];
+    super::TEST_SIZE_OWN_HANDLE.set(Some(true));
+    let built = [
+        build(&[TABLE, COUNT, STORE].concat(), (4, 16)),
+        build(&[TABLE, COUNT, &load, STORE].concat(), (4, 16)),
+    ];
+    super::TEST_SIZE_OWN_HANDLE.set(None);
+    let (mut data, texel) = ([0u32; 12], [[0.0; 4]; 1]);
+    data[0] = 77;
+    let views = [
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+        View::Texture(1, 1, &texel),
+        View::RawUav(2),
+    ];
+    for (shader, read) in built.into_iter().zip([0, 77]) {
+        let shader = shader.expect("translates");
+        for (label, got) in run(&shader, &views) {
+            assert_eq!(got[..2], [3, read], "{label}");
+        }
+    }
+}
+
+/// With `VICTORY_SIZE_OWN_HANDLE` on, a pixel shader asks a buffer's size
+/// through the handle it reads through, as before: a helper lane's first-lane
+/// read is undefined, so no `waveReadLaneFirst` may make its handle. The same
+/// program as a compute shader does take the size's own handle.
+#[test]
+fn a_pixel_shader_asks_the_size_without_a_first_lane_read() {
+    let words = [TABLE, COUNT, STORE].concat();
+    super::TEST_SIZE_OWN_HANDLE.set(Some(true));
+    let compute = lowered(&words, (4, 16), HwStage::Cs);
+    let pixel = lowered(&words, (4, 16), HwStage::Ps);
+    super::TEST_SIZE_OWN_HANDLE.set(None);
+    assert!(compute.expect("translates").wave_ops, "compute: the size's own handle");
+    assert!(!pixel.expect("translates").wave_ops, "pixel: no first-lane read");
+}
+
+/// With `VICTORY_SIZE_OWN_HANDLE` on, in the DXIL as written (after the
+/// clean-up passes): the size query and the load use two handles, and the
+/// size's comes from a heap index read from the first lane. Needs `dxc.exe`
+/// beside the validator (`VICTORY_PC_DXC` names another); skipped without it.
+#[cfg(windows)]
+#[test]
+fn the_size_handle_stays_apart_from_the_read() {
+    let dxc = match std::env::var_os("VICTORY_PC_DXC") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => match validator::Validator::default_path() {
+            Some(p) => p.with_file_name("dxc.exe"),
+            None => return eprintln!("no dxc; skipped"),
+        },
+    };
+    if !dxc.exists() {
+        return eprintln!("no dxc; skipped");
+    }
+    let load = [0x7E06_0280, 0xE030_2000, 0x8002_0503, 0x7E0A_0505];
+    super::TEST_SIZE_OWN_HANDLE.set(Some(true));
+    let shader = build(&[TABLE, COUNT, &load, STORE].concat(), (4, 16));
+    super::TEST_SIZE_OWN_HANDLE.set(None);
+    let file =
+        std::env::temp_dir().join(format!("victory-size-handle-{}.dxil", std::process::id()));
+    std::fs::write(&file, shader.expect("translates").dxil).unwrap();
+    let out = std::process::Command::new(dxc)
+        .arg("-dumpbin")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The value an instruction defines, and its line; the handle a call takes first.
+    let def = |id: &str| {
+        text.lines()
+            .find(|l| l.trim_start().starts_with(&format!("{id} = ")))
+            .unwrap_or("")
+    };
+    let handle_of = |op: &str| {
+        let line = text
+            .lines()
+            .find(|l| l.contains(op))
+            .unwrap_or_else(|| panic!("no {op}"));
+        let at = line.find("%dx.types.Handle %").unwrap() + "%dx.types.Handle ".len();
+        line[at..].split([',', ')']).next().unwrap().to_owned()
+    };
+    let (size, read) = (
+        handle_of("@dx.op.getDimensions"),
+        handle_of("@dx.op.rawBufferLoad"),
+    );
+    assert_ne!(size, read, "one handle for the size and the read");
+    // annotateHandle(createHandleFromHeap(waveReadLaneFirst(..)))
+    // The value (`%n`) right after `before` in `line`.
+    let operand = |line: &str, before: &str| {
+        let at = line
+            .find(before)
+            .unwrap_or_else(|| panic!("no {before:?} in {line:?}"));
+        let rest = &line[at + before.len()..];
+        rest.split([',', ')']).next().unwrap().trim().to_owned()
+    };
+    let made = operand(def(&size), "annotateHandle(i32 216, %dx.types.Handle ");
+    let index = operand(def(&made), "createHandleFromHeap(i32 218, i32 ");
+    assert!(def(&index).contains("waveReadLaneFirst"), "{}", def(&index));
 }

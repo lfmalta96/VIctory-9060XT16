@@ -139,6 +139,11 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // A buffer's size through a handle of its own (`VICTORY_SIZE_OWN_HANDLE=1`).
+        // Only when on, so the translations cached without it keep their key.
+        if victory_shader::emit::size_own_handle() {
+            bytes.extend_from_slice(b"VICTORY_SIZE_OWN_HANDLE=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
