@@ -175,6 +175,9 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    /// Raw COM pointer (`as_raw() as usize`, 0 for `None`) mirroring `kept`
+    /// so unchanged slots skip both the per-slot mutex and COM `AddRef`/`Release`.
+    kept_raw: Box<[std::sync::atomic::AtomicUsize]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1779,6 +1782,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            kept_raw: (0..count + extra).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -2607,8 +2611,7 @@ impl HostHeap {
             return;
         }
         // Once per slot and frame: tables are read by every draw.
-        if old != now | TABLED_READ {
-            stamp.store(now | TABLED_READ, Relaxed);
+        if old != now | TABLED_READ && stamp.swap(now | TABLED_READ, Relaxed) != now | TABLED_READ {
             if tabled_out() && self.queued.may(index) {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
                 if textures.take_out(index) {
@@ -2880,7 +2883,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
         })
     }
@@ -2938,20 +2941,62 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        use std::sync::atomic::Ordering;
+        use windows::core::Interface;
+        let Some(raw_slot) = self.kept_raw.get(index as usize) else {
+            return;
+        };
+        let new_raw = resource.as_ref().map_or(0, |r| r.as_raw() as usize);
+        if raw_slot.load(Ordering::Acquire) == new_raw {
+            return;
+        }
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
         let old = {
-            use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
             if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+                raw_slot.store(new_raw, Ordering::Release);
                 return;
             }
-            std::mem::replace(&mut *slot, resource)
+            let prev = std::mem::replace(&mut *slot, resource);
+            raw_slot.store(new_raw, Ordering::Release);
+            prev
         };
         // A running submission may still read the old resource through
         // this slot.
+        if let Some(old) = old {
+            crate::host::retire_resource(old);
+        }
+    }
+
+    /// Borrowed fast-path for [`HostHeap::keep`]: skips both the per-slot
+    /// mutex and COM `AddRef`/`Release` when slot `index` already holds the
+    /// same resource.
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        use std::sync::atomic::Ordering;
+        use windows::core::Interface;
+        let Some(raw_slot) = self.kept_raw.get(index as usize) else {
+            return;
+        };
+        let new_raw = resource.map_or(0, |r| r.as_raw() as usize);
+        if raw_slot.load(Ordering::Acquire) == new_raw {
+            return;
+        }
+        let Some(slot) = self.kept.get(index as usize) else {
+            return;
+        };
+        let old = {
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
+                raw_slot.store(new_raw, Ordering::Release);
+                return;
+            }
+            let prev = std::mem::replace(&mut *slot, resource.cloned());
+            raw_slot.store(new_raw, Ordering::Release);
+            prev
+        };
         if let Some(old) = old {
             crate::host::retire_resource(old);
         }
@@ -2990,7 +3035,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3033,7 +3078,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3121,7 +3166,7 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -3169,7 +3214,7 @@ impl HostHeap {
             host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
         }
         self.twin_made(index, true);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
         true
     }
 
