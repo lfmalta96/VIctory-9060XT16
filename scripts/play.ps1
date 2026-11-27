@@ -51,6 +51,8 @@ if ($Safe) {
     $settings.VICTORY_DSTORAGE_PRIORITY = 'below'
     # Renderer patches 1, 5, 6 and 7 (patch 2 / PORT_DESCRIPTORS left off: misses draw-table writers).
     $settings.VICTORY_PORT_CONSTANTS = '1'
+    # Keep indirect batching enabled by default (set to '1' via -More to reduce tree/lamp flicker at ~2 fps cost).
+    $settings.VICTORY_PORT_CONSTANTS_ORDER = '0'
     $settings.VICTORY_PORT_CBV = '1'
     $settings.VICTORY_PORT_GUARD = '1'
     $settings.VICTORY_PORT_JOURNAL = '1'
@@ -85,7 +87,7 @@ try {
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $logFile = Join-Path $root "victory-run-$stamp.log"
         Write-Host "Saving full log to $logFile (press F9 in-game for instant perf snapshot; run scripts\extract-perf.ps1 after)"
-        & $victory run $Exe --execute --console $Console 2>&1 | Tee-Object -FilePath $logFile
+        & $victory run $Exe --execute --console $Console 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $logFile
     } else {
         & $victory run $Exe --execute --console $Console
     }
