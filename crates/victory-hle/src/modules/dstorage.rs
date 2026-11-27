@@ -149,8 +149,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let name_hash = disk_cache::hash_file(&name, file_len);
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files, name_hash });
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
@@ -276,10 +278,202 @@ static FACTORY_VTABLE: Methods<16> = Methods([
     missing::<15> as *const (),
 ]);
 
+// Decompressed block disk cache (`VICTORY_DSTORAGE_CACHE_MB=<MiB>`, off by default).
+mod disk_cache {
+    use std::io::Read;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    use super::{BCPACK, Request, ZLIB};
+
+    struct Config {
+        dir: PathBuf,
+        max_bytes: u64,
+        used_bytes: AtomicU64,
+        hits: AtomicU64,
+        misses: AtomicU64,
+        hit_bytes: AtomicU64,
+        stored_bytes: AtomicU64,
+    }
+
+    fn config() -> Option<&'static Config> {
+        static CFG: OnceLock<Option<Config>> = OnceLock::new();
+        CFG.get_or_init(|| {
+            let mb: u64 = std::env::var("VICTORY_DSTORAGE_CACHE_MB")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            if mb == 0 {
+                return None;
+            }
+            let base = std::env::var_os("VICTORY_CACHE_DIR")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("victory")))
+                .unwrap_or_else(std::env::temp_dir);
+            let dir = base.join("dstorage-decompressed");
+            if std::fs::create_dir_all(&dir).is_err() {
+                return None;
+            }
+            let mut existing = 0u64;
+            if let Ok(shards) = std::fs::read_dir(&dir) {
+                for shard in shards.flatten() {
+                    if let Ok(entries) = std::fs::read_dir(shard.path()) {
+                        for entry in entries.flatten() {
+                            if let Ok(meta) = entry.metadata() {
+                                existing = existing.saturating_add(meta.len());
+                            }
+                        }
+                    }
+                }
+            }
+            let max_bytes = mb << 20;
+            tracing::info!(
+                dir = %dir.display(),
+                existing_mb = existing >> 20,
+                max_mb = mb,
+                "dstorage: decompressed block disk cache enabled (VICTORY_DSTORAGE_CACHE_MB)"
+            );
+            Some(Config {
+                dir,
+                max_bytes,
+                used_bytes: AtomicU64::new(existing),
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+                hit_bytes: AtomicU64::new(0),
+                stored_bytes: AtomicU64::new(0),
+            })
+        })
+        .as_ref()
+    }
+
+    pub(super) fn enabled() -> bool {
+        config().is_some()
+    }
+
+    #[inline]
+    fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
+        let mut h = seed;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    #[inline]
+    fn mix(mut x: u64) -> u64 {
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    }
+
+    pub(super) fn hash_file(name: &str, file_len: u64) -> (u64, u64) {
+        let lower = name.to_ascii_lowercase();
+        let b = lower.as_bytes();
+        let h1 = mix(fnv1a(0xcbf2_9ce4_8422_2325, b) ^ file_len);
+        let h2 = mix(fnv1a(0xaf63_dc4c_8601_ec8c, b) ^ file_len.rotate_left(17));
+        (h1, h2)
+    }
+
+    pub(super) struct Key {
+        shard: u8,
+        name: String,
+    }
+
+    pub(super) fn key(file_hash: (u64, u64), req: &Request) -> Key {
+        let mut h1 = file_hash.0 ^ req.offset.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        h1 = mix(h1 ^ u64::from(req.source_size) ^ (u64::from(req.destination_size) << 32));
+        let mut h2 = file_hash.1 ^ req.offset.rotate_left(23);
+        h2 = mix(h2 ^ (req.options & (ZLIB | BCPACK)) ^ u64::from(req.intermediate_size).rotate_left(11));
+        let shard = (h1 & 0xff) as u8;
+        Key { shard, name: format!("{h1:016x}{h2:016x}") }
+    }
+
+    fn path_for(cfg: &Config, k: &Key) -> PathBuf {
+        cfg.dir.join(format!("{:02x}", k.shard)).join(&k.name)
+    }
+
+    fn maybe_log(cfg: &Config) {
+        let total = cfg.hits.load(Relaxed) + cfg.misses.load(Relaxed);
+        if total > 0 && total.is_multiple_of(2000) {
+            tracing::info!(
+                hits = cfg.hits.load(Relaxed),
+                misses = cfg.misses.load(Relaxed),
+                hit_mb = cfg.hit_bytes.load(Relaxed) >> 20,
+                stored_mb = cfg.stored_bytes.load(Relaxed) >> 20,
+                used_mb = cfg.used_bytes.load(Relaxed) >> 20,
+                max_mb = cfg.max_bytes >> 20,
+                "dstorage: disk cache"
+            );
+        }
+    }
+
+    pub(super) fn open_hit(k: &Key, max_out: usize) -> Option<(std::fs::File, usize)> {
+        let cfg = config()?;
+        let path = path_for(cfg, k);
+        let file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len() as usize;
+        if len == 0 || len > max_out {
+            return None;
+        }
+        Some((file, len))
+    }
+
+    pub(super) fn read_hit(mut file: std::fs::File, len: usize, out: &mut [u8]) -> Option<usize> {
+        let cfg = config()?;
+        if out.len() < len || file.read_exact(&mut out[..len]).is_err() {
+            return None;
+        }
+        cfg.hits.fetch_add(1, Relaxed);
+        cfg.hit_bytes.fetch_add(len as u64, Relaxed);
+        maybe_log(cfg);
+        Some(len)
+    }
+
+    pub(super) fn write(k: &Key, data: &[u8]) {
+        let Some(cfg) = config() else { return };
+        cfg.misses.fetch_add(1, Relaxed);
+        maybe_log(cfg);
+        if data.is_empty() {
+            return;
+        }
+        let len = data.len() as u64;
+        // Reserve capacity atomically so we never exceed `max_bytes`.
+        let prev = cfg.used_bytes.fetch_add(len, Relaxed);
+        if prev.saturating_add(len) > cfg.max_bytes {
+            cfg.used_bytes.fetch_sub(len, Relaxed);
+            return;
+        }
+        let shard_dir = cfg.dir.join(format!("{:02x}", k.shard));
+        let _ = std::fs::create_dir_all(&shard_dir);
+        let final_path = shard_dir.join(&k.name);
+        if final_path.exists() {
+            cfg.used_bytes.fetch_sub(len, Relaxed);
+            return;
+        }
+        let tmp_path = shard_dir.join(format!("{}.tmp.{}", k.name, super::this_thread()));
+        if std::fs::write(&tmp_path, data).is_ok() {
+            if std::fs::rename(&tmp_path, &final_path).is_ok() {
+                cfg.stored_bytes.fetch_add(len, Relaxed);
+            } else {
+                let _ = std::fs::remove_file(&tmp_path);
+                cfg.used_bytes.fetch_sub(len, Relaxed);
+            }
+        } else {
+            let _ = std::fs::remove_file(&tmp_path);
+            cfg.used_bytes.fetch_sub(len, Relaxed);
+        }
+    }
+}
+
 // Files.
 
 struct File {
     files: Files,
+    name_hash: (u64, u64),
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -645,6 +839,12 @@ fn scheduler() -> Option<&'static Scheduler> {
         // `VICTORY_DSTORAGE_PRIORITY=below`: workers below normal, behind the
         // frame threads (the title's own streaming thread already is).
         let below = std::env::var("VICTORY_DSTORAGE_PRIORITY").is_ok_and(|v| v.trim() == "below");
+        // `VICTORY_DSTORAGE_AFFINITY`: optional hex bitmask (e.g. `0xF00`) pinning
+        // DirectStorage workers to specific logical processors.
+        let affinity = std::env::var("VICTORY_DSTORAGE_AFFINITY")
+            .ok()
+            .and_then(|v| usize::from_str_radix(v.trim().trim_start_matches("0x").trim_start_matches("0X"), 16).ok())
+            .filter(|&m| m != 0);
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -657,12 +857,17 @@ fn scheduler() -> Option<&'static Scheduler> {
                             // SAFETY: the pseudo-handle of the calling thread.
                             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
                         }
+                        if let Some(mask) = affinity {
+                            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+                            // SAFETY: the pseudo-handle of the calling thread.
+                            unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) };
+                        }
                         work(scheduler)
                     })
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, below, "dstorage: workers");
+        tracing::info!(workers = started, below, affinity = affinity.map(|m| format!("{m:#x}")), "dstorage: workers");
     });
     Some(scheduler)
 }
@@ -1464,6 +1669,30 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         return into_destination(request, size, |out| read_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
+    let cache_key = if options & MEMORY_SOURCE == 0 && disk_cache::enabled() {
+        // SAFETY: `request.validate()` verified `request.source` is a non-null file object.
+        let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
+        Some(disk_cache::key(file.name_hash, request))
+    } else {
+        None
+    };
+    if let Some(ref k) = cache_key
+        && let Some((file, len)) = disk_cache::open_hit(k, size)
+    {
+        let mut ok = false;
+        let res = into_destination(request, size, |out| {
+            if let Some(n) = disk_cache::read_hit(file.try_clone().map_err(|_| INVALID_DATA)?, len, out) {
+                ok = true;
+                Ok(n)
+            } else {
+                Ok(0)
+            }
+        });
+        if ok {
+            res.map_err(|hr| fail(hr, "disk cache"))?;
+            return Ok(());
+        }
+    }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
@@ -1477,11 +1706,17 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+    into_destination(request, size, |out| {
+        let written = match tables {
+            Some(tables) => bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string()))?,
+            None => inflate(&source, out).map_err(|hr| fail(hr, "zlib"))?,
+        };
+        if let Some(ref k) = cache_key {
+            disk_cache::write(k, &out[..written]);
+        }
+        Ok(written)
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
