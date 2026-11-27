@@ -58,7 +58,12 @@ pub(crate) fn on() -> bool {
 /// culling, small read-outs) are small.
 pub(crate) fn no_back() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK").is_some_and(|v| v == "1" || v == "2"))
+}
+
+fn no_back_cached() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK").is_some_and(|v| v == "2"))
 }
 
 fn no_back_min() -> usize {
@@ -114,8 +119,11 @@ pub(crate) fn skip_back(address: usize, len: usize, carded: bool, watched: bool)
     if !no_back() || len == 0 {
         return false;
     }
-    let wc = kind(address) == Kind::WriteCombined && kind(address + len - 1) == Kind::WriteCombined;
-    if !wc {
+    let k0 = kind(address);
+    let k1 = kind(address + len - 1);
+    let wc = k0 == Kind::WriteCombined && k1 == Kind::WriteCombined;
+    let cached_large = !wc && no_back_cached() && len >= (256 << 10) && k0 == Kind::Cached && k1 == Kind::Cached;
+    if !wc && !cached_large {
         return false;
     }
     if len < no_back_min() {
