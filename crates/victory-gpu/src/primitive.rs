@@ -152,8 +152,13 @@ fn f32_to_half(v: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let man = bits & 0x7f_ffff;
+    if v.is_nan() {
+        // Keep NaNs distinct from infinity, retaining the upper payload
+        // bits and setting the quiet bit even if the payload truncates.
+        return sign | 0x7e00 | (man >> 13) as u16;
+    }
     if exp >= 31 {
-        return sign | 0x7c00; // too large: infinity
+        return sign | 0x7c00; // too large or infinity
     }
     if exp <= 0 {
         if exp < -10 {
@@ -170,10 +175,11 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest: a carry out of the mantissa is added into the
-    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
+    // Round to nearest, ties to even, just as for subnormals. A carry
+    // out of the mantissa raises the exponent (at most to infinity).
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    let bias = 0x0fff + ((man >> 13) & 1);
+    sign | (half + ((man + bias) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -283,6 +289,49 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+
+    #[test]
+    fn normal_half_midpoints_round_to_even_for_both_signs() {
+        // Check every adjacent pair of finite nonnegative half values,
+        // including the subnormal/normal and exponent boundaries.
+        for lower in 0u16..0x7bff {
+            let upper = lower + 1;
+            let midpoint = (half_to_f32(lower) + half_to_f32(upper)) * 0.5;
+            let even = if lower & 1 == 0 { lower } else { upper };
+            assert_eq!(f32_to_half(midpoint), even, "midpoint after {lower:#06x}");
+            assert_eq!(f32_to_half(-midpoint), even | 0x8000);
+            let bits = midpoint.to_bits();
+            assert_eq!(f32_to_half(f32::from_bits(bits - 1)), lower);
+            assert_eq!(f32_to_half(f32::from_bits(bits + 1)), upper);
+        }
+        assert_eq!(f32_to_half(65520.0), 0x7c00);
+        assert_eq!(f32_to_half(-65520.0), 0xfc00);
+    }
+
+    #[test]
+    fn half_nan_does_not_become_infinity() {
+        for bits in [0x7f80_0001, 0x7fc0_0000, 0x7fff_ffff, 0xffc1_2345] {
+            let half = f32_to_half(f32::from_bits(bits));
+            assert_eq!(half & 0x7c00, 0x7c00);
+            assert_ne!(half & 0x03ff, 0);
+            assert_eq!(half & 0x8000, ((bits >> 16) as u16) & 0x8000);
+            assert!(half_to_f32(half).is_nan());
+        }
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_half(f32::NEG_INFINITY), 0xfc00);
+    }
+
+    #[test]
+    fn rectangle_half_attributes_preserve_nan() {
+        let src: Vec<u8> = [0x7e00_u16, 0x3c00, 0x3c00]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        let mut dst = [0; 6 * 2];
+        expand_rects(&src, &mut dst, 2, &[(0, 54)]);
+        let fourth = u16::from_le_bytes([dst[10], dst[11]]);
+        assert!(half_to_f32(fourth).is_nan());
     }
 
     #[test]
