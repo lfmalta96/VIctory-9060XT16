@@ -31,7 +31,9 @@ and **AMD Radeon RX 9060 XT 16 GB (RDNA 4)**, Series S 1080p profile, ray tracin
 | `v0.0.4-alpha` | `VICTORY_WAIT_RESIDENT=textures`, `VICTORY_PRESSURE_PHYSICAL=1`, pooled `HostList::upload()`, `VICTORY_LANE_CORE=0`, `VICTORY_THIN_THREADS=4` | ~12 fps (84 ms/frame), `MakeResident` stalls eliminated, `SUB` 46.6 ms |
 | `v0.0.5-alpha` | 11 upstream perf/fix PRs (`AddressHash`, `early-frame-load`, `read-gaps`, `dstorage` workers/priority, XMA priority) + raised scratch/upload pools & allocator retire cap | 11.0 fps (91 ms, **max spike cut 148 → 99 ms**), D3D12 kernel churn (`win32u.dll`) cut **-46.6%** (`500 → 267` samples), VRAM `9.5 GiB` |
 | `v0.0.6-alpha` | Integrated `avatarmanz` visual fixes (`VICTORY_AMBIENT_REFLECT`, live TV/phone textures, BC7 Series S fix, detile retry, `-SkipIntro`) + Belobug O(n²) fixes (`#440`, `#437`, `#434`) + `SPARE_BATCH` pool `16 → 128` | Identified `VICTORY_PORT_CONSTANTS_ORDER=1` clamping 1,505 indirect draws individually (-2 fps regression) |
-| `v0.0.7-alpha` | Disabled `VICTORY_PORT_CONSTANTS_ORDER=0` by default (opt-in for anti-flicker), clean PowerShell `-SaveLog` output, full `VIctory-9060XT16` identity | Current build |
+| `v0.0.7-alpha` | Disabled `VICTORY_PORT_CONSTANTS_ORDER=0` by default (opt-in for anti-flicker), clean PowerShell `-SaveLog` output, full `VIctory-9060XT16` identity | ~11 fps (~90 ms/frame), GPU ~50% busy |
+| `v0.0.8-alpha` | Integrated `shadow::exact` GPU-quarantined buffer pool (`Belobug #451`), OS file cache (`VICTORY_FILE_CACHE=1`), barrier legal states (`#449`) & safe reads (`#460`) | 10.9–12.2 fps (82–92 ms/frame), GPU 49–54% busy (Series X 1080p) |
+| `v0.0.9-alpha` (WIP) | Eliminated `HostList` pool thrashing (`boxed` → `fresh_list()`, `idle_most` 384, offloaded `land()` from `victory-submit`) + `Belobug #443`, `#477` (`VICTORY_WC_NO_BACK`), `#503`, `#518` + `avatarmanz #431`, `#437` (`VICTORY_TWIN_EXACT`), `#446` | **14.3 fps (69.7 ms/frame)**, GPU **65–70% busy**, `0 host lists made/frame` (`-96%` `victory-list-*` D3D12 waits, `-100%` `victory-submit` `DestroyAllocation2`) |
 
 ## What Is Different in `VIctory-9060XT16`
 
