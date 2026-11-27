@@ -1428,6 +1428,13 @@ mod host {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
                     }
+                    match vk {
+                        b'W' => pad.left_y = 1.0,
+                        b'S' => pad.left_y = -1.0,
+                        b'A' => pad.left_x = -1.0,
+                        b'D' => pad.left_x = 1.0,
+                        _ => {}
+                    }
                 }
             }
             Some(pad)
