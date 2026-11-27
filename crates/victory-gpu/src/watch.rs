@@ -776,6 +776,11 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     if AHEAD_KEPT.load(std::sync::atomic::Ordering::Acquire) || journal().kept {
         return;
     }
+    let pieces = filter_and_sort_ranges(ranges);
+    ask_ahead_pieces(&pieces, held);
+}
+
+fn filter_and_sort_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -783,10 +788,14 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
+    pieces.sort_unstable();
+    pieces
+}
+
+fn ask_ahead_pieces(pieces: &[(usize, usize)], held: bool) {
     if pieces.len() < 2 {
         return;
     }
-    pieces.sort_unstable();
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut runs = Vec::new();
@@ -1053,15 +1062,16 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // other threads' askings again (0.5 ms a time, run fills-ab3), and no
     // other asking comes between the two parts.
     let _all = Asking::hold_all();
-    ask_ahead_held(ranges, true);
+    let pieces = filter_and_sort_ranges(ranges);
+    ask_ahead_pieces(&pieces, true);
     spent.next("asking: the rest");
-    ask_rest(ranges, true);
+    ask_rest_pieces(&pieces, true);
     spent.end();
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
-/// asking stands.
-fn ask_rest(ranges: &[(usize, usize)], held: bool) {
+/// asking stands. `pieces` is already filtered and sorted by `(first, last)`.
+fn ask_rest_pieces(pieces: &[(usize, usize)], held: bool) {
     let _all = (!held).then(Asking::hold_all);
     let mut ahead = {
         let mut j = journal_mut();
@@ -1073,16 +1083,16 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
-    // Those not held by an asking ahead, each once.
+    // Those not held by an asking ahead, each once. Because `pieces` is sorted
+    // by `(first, last)`, a range is contained in a previous `alone_ranges`
+    // entry iff the last pushed entry covers it.
     let mut alone_ranges: Vec<(usize, usize)> = Vec::new();
     let mut held_ahead = Ahead::new();
     held_ahead.set(std::mem::take(&mut ahead));
-    for &(start, end) in ranges {
-        if start >= end || published(start, end) || refused_as_view(start, end) {
-            continue;
-        }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !held_ahead.holds(first, last) && !alone_ranges.iter().any(|&(a, b)| a <= first && last <= b) {
+    for &(first, last) in pieces {
+        if !held_ahead.holds(first, last)
+            && !alone_ranges.last().is_some_and(|&(a, b)| a <= first && last <= b)
+        {
             alone_ranges.push((first, last));
         }
     }

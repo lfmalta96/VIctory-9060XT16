@@ -8491,28 +8491,61 @@ struct ListFront {
 fn list_front(steps: &[Step], textures: bool) -> ListFront {
     let mut shadows: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>)> = Vec::new();
     let mut staged: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
-    let mut refreshed: ByCopy<()> = ByCopy::default();
-    let touches = steps.iter().filter_map(|step| match step {
-        Step::Refresh(shadow, from, len) => {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            if refreshed.insert(key, ()).is_none() {
-                shadows.push((key, shadow.clone()));
+    let mut at: ByCopy<usize> = ByCopy::default();
+    let mut copies: Vec<(usize, usize, usize, bool)> = Vec::new();
+    let mut last = usize::MAX;
+    for step in steps {
+        match step {
+            Step::Refresh(shadow, from, len) => {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let (from, to) = (*from, *from + *len);
+                let i = if copies.get(last).is_some_and(|c| c.0 == key) {
+                    last
+                } else {
+                    *at.entry(key).or_insert_with(|| {
+                        shadows.push((key, shadow.clone()));
+                        copies.push((key, usize::MAX, 0, false));
+                        copies.len() - 1
+                    })
+                };
+                last = i;
+                let c = &mut copies[i];
+                if !c.3 {
+                    if c.1 == usize::MAX {
+                        // First refresh of a copy that was previously only written.
+                        if !shadows.iter().any(|(k, _)| *k == key) {
+                            shadows.push((key, shadow.clone()));
+                        }
+                    }
+                    c.1 = c.1.min(from);
+                    c.2 = c.2.max(to);
+                }
             }
-            Some(Touch::Refresh(key, *from, *from + *len))
+            Step::GpuWrite(shadow, ..) => {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let i = if copies.get(last).is_some_and(|c| c.0 == key) {
+                    last
+                } else {
+                    *at.entry(key).or_insert_with(|| {
+                        copies.push((key, usize::MAX, 0, false));
+                        copies.len() - 1
+                    })
+                };
+                last = i;
+                copies[i].3 = true;
+            }
+            Step::Texture(upload) if textures => {
+                staged.push(upload.staging.clone());
+            }
+            _ => {}
         }
-        Step::GpuWrite(shadow, ..) => Some(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
-        Step::Texture(upload) if textures => {
-            staged.push(upload.staging.clone());
-            None
-        }
-        _ => None,
-    });
-    let copies = fold_touches(touches);
+    }
     ListFront { copies, shadows, textures: staged }
 }
 
 /// Touches of one list, per copy in the order of their first touch: the span
 /// of its refreshes before its first write, and whether it is written.
+#[cfg(test)]
 fn fold_touches(touches: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize, bool)> {
     let mut at: ByCopy<usize> = ByCopy::default();
     let mut copies: Vec<(usize, usize, usize, bool)> = Vec::new();
@@ -8900,7 +8933,7 @@ impl Batch {
             return;
         }
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
-        let mut touches = Vec::new();
+        let mut touches = Vec::with_capacity(steps);
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
                 touches.push(Touch::Part);

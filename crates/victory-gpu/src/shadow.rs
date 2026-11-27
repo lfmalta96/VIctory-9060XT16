@@ -5274,8 +5274,13 @@ fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
     })?;
     // Whoever takes the map to let a copy go that nobody holds finds it held
     // now, or had counted before: then it is not handed out.
+    // On x86_64, `Weak::upgrade()` already executed a `LOCK CMPXCHG` full
+    // barrier, so a compiler fence suffices without a redundant `MFENCE`.
+    #[cfg(target_arch = "x86_64")]
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    #[cfg(not(target_arch = "x86_64"))]
     std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+    (BUFFERS_CHANGED.load(Ordering::Acquire) == changed).then_some(shadow)
 }
 
 /// Remembers an answer given while `changed` was the count.
