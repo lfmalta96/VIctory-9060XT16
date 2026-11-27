@@ -37,22 +37,23 @@ $settings = @{
     VICTORY_SIZE_OWN_HANDLE = '1'
 }
 if ($Build -eq 'diag') { $settings.VICTORY_D3D12_DRED = 'light' }
-if ($Console -eq 'series-s') {
-    # Removes stippled hair, foliage and fences on the Series S profile (#279).
-    $settings.VICTORY_UPSCALER = '6'
-}
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
+    # Best balance on 6-core/12-thread CPUs (Ryzen 5 5500): 4 list workers and no exclusive lane core.
+    $settings.VICTORY_THIN_THREADS = '4'
+    $settings.VICTORY_LANE_CORE = '0'
+    # Keep DirectStorage CPU decompression from starving frame-critical threads during bursts.
+    $settings.VICTORY_DSTORAGE_WORKERS = '4'
+    $settings.VICTORY_DSTORAGE_PRIORITY = 'below'
     # Renderer patches 1, 5, 6 and 7 (patch 2 / PORT_DESCRIPTORS left off: misses draw-table writers).
     $settings.VICTORY_PORT_CONSTANTS = '1'
     $settings.VICTORY_PORT_CBV = '1'
     $settings.VICTORY_PORT_GUARD = '1'
     $settings.VICTORY_PORT_JOURNAL = '1'
-    # Offload >=1 MiB buffer comparisons to GPU and reserve one physical core (>=6 cores) for victory-submit.
+    # Offload >=1 MiB buffer comparisons to GPU.
     $settings.VICTORY_CARD_BUFFERS_MIN_MB = '1'
-    $settings.VICTORY_LANE_CORE = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }

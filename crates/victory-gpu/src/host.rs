@@ -2202,7 +2202,7 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them.
-const SPARE_MOST: u64 = 128 << 20;
+const SPARE_MOST: u64 = 384 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
 
@@ -2280,7 +2280,7 @@ const UPLOAD_POOL_MIN: u64 = 64 << 10;
 /// copies bypass the pool so they do not pin memory.
 const UPLOAD_POOL_MAX: u64 = 16 << 20;
 /// Maximum pooled list upload bytes kept on 32 GiB hosts (`limited_host_ram`).
-const UPLOAD_POOL_MOST: u64 = 128 << 20;
+const UPLOAD_POOL_MOST: u64 = 256 << 20;
 /// Maximum pooled list upload bytes kept on hosts with >32 GiB RAM.
 const UPLOAD_POOL_KEPT: u64 = 256 << 20;
 
@@ -6910,7 +6910,7 @@ impl HostList {
     }
 
     pub(crate) fn should_retire(&self) -> bool {
-        self.resets.load(Ordering::Relaxed) >= 256
+        self.resets.load(Ordering::Relaxed) >= 4096
     }
 
     /// Only after the list's last submission finished (every one is waited
