@@ -979,11 +979,7 @@ struct Waiting {
     /// Bytes of its memory that were mapped when it was last uploaded
     /// without all of it there; 0: not uploaded yet.
     mapped: u64,
-    /// For a slot uploaded whole and looked at again
-    /// ([`TextureQueue::recheck`]): where its memory is (address, bytes),
-    /// the fingerprint it had at the upload, how many looks found it
-    /// unchanged, and the frame of the upload. A fingerprint of 0: none.
-    checked: (u64, u64, u64, u8, u64),
+    checked: TextureRecheck,
     /// When the slot first waited for this (`crate::host::now_ms`), for
     /// `crate::texlate`: kept over writes until it is brought up to date;
     /// and whether it waited for its memory meanwhile.
@@ -991,6 +987,19 @@ struct Waiting {
     waited: bool,
     /// When a look last found its memory away (or no more of it): 0 none.
     away: u64,
+}
+
+/// The last whole upload of a texture picked by index. A zero fingerprint
+/// means the slot has no recheck scheduled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TextureRecheck {
+    pub(crate) address: u64,
+    pub(crate) bytes: u64,
+    pub(crate) fingerprint: u64,
+    pub(crate) unchanged_looks: u8,
+    pub(crate) uploaded: u64,
+    /// This descriptor has already had an in-place change without a notice.
+    pub(crate) changed_in_place: bool,
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -1071,7 +1080,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: TextureRecheck::default(), since, waited, away });
     }
 
     /// What a slot written again keeps of its wait.
@@ -1198,22 +1207,22 @@ impl TextureQueue {
         }
     }
 
-    /// Slot `index` was uploaded whole from memory `at` (address, bytes)
-    /// with fingerprint `print`: looked at again from frame `due`, for a
-    /// title that fills a texture's memory after it wrote the view (the
-    /// `looks`-th such look; `uploaded` is the upload's frame).
-    #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+    /// Look at the texture again from frame `due`, unless its descriptor
+    /// was rewritten during the pass.
+    fn recheck(&mut self, index: u32, write: u64, due: u64, checked: TextureRecheck) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
-            w.checked = (at.0, at.1, print, looks, uploaded);
+            w.checked = checked;
         }
     }
 
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
     /// waiting for such a look.
-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
+    fn checked(&self, index: u32, write: u64) -> Option<TextureRecheck> {
+        self.slots
+            .get(&index)
+            .filter(|w| w.write == write && w.checked.fingerprint != 0)
+            .map(|w| w.checked)
     }
 
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
@@ -1225,7 +1234,7 @@ impl TextureQueue {
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: TextureRecheck::default(), since, waited, away });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1960,7 +1969,7 @@ impl HostHeap {
             .slots
             .iter()
             .filter(|(_, w)| w.due <= frame)
-            .map(|(&index, w)| (index, w.mapped > 0 || w.checked.2 != 0))
+            .map(|(&index, w)| (index, w.mapped > 0 || w.checked.fingerprint != 0))
             .collect()
     }
 
@@ -1983,24 +1992,14 @@ impl HostHeap {
     }
 
     /// Title slot `index` was uploaded whole: see [`TextureQueue::recheck`].
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn texture_slot_recheck(
-        &self,
-        index: u32,
-        write: u64,
-        due: u64,
-        at: (u64, u64),
-        print: u64,
-        looks: u8,
-        uploaded: u64,
-    ) {
+    pub(crate) fn texture_slot_recheck(&self, index: u32, write: u64, due: u64, checked: TextureRecheck) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        textures.recheck(index, write, due, checked);
     }
 
     /// See [`TextureQueue::checked`].
-    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
+    pub(crate) fn texture_slot_checked(&self, index: u32, write: u64) -> Option<TextureRecheck> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index, write)
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
@@ -2120,7 +2119,7 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         // Uploaded before: out of the queue, or in it after an upload (in
         // part, or whole and being looked at again).
-        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
+        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.fingerprint != 0));
         PAGE_WRITES[2].fetch_add(held as u64, Relaxed);
         PAGE_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
         if !due {
@@ -3464,7 +3463,7 @@ impl HostHeap {
                 w.written,
                 w.looks,
                 w.mapped,
-                w.checked.2 != 0
+                w.checked.fingerprint != 0
             ),
         }
     }
@@ -5687,6 +5686,31 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    #[test]
+    fn a_descriptor_rewrite_clears_periodic_texture_rechecks() {
+        let mut queue = TextureQueue::default();
+        queue.written(1, 1, 1, false);
+        let write = queue.due(1, 1)[0].1;
+        let checked = TextureRecheck {
+            address: 0x10000,
+            bytes: 0x2000,
+            fingerprint: 1,
+            unchanged_looks: 4,
+            uploaded: 1,
+            changed_in_place: true,
+        };
+        queue.recheck(1, write, 401, checked);
+        assert!(queue.due(400, 1).is_empty());
+        assert_eq!(queue.due(401, 1), [(1, write)]);
+        assert_eq!(queue.checked(1, write), Some(checked));
+
+        queue.written(1, 402, 402, false);
+        let new_write = queue.due(402, 1)[0].1;
+        queue.recheck(1, write, 801, checked);
+        assert_eq!(queue.due(402, 1), [(1, new_write)]);
+        assert_eq!(queue.checked(1, new_write), None);
     }
 
     /// Slots held back for lack of room on the card are not handed out
