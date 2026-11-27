@@ -293,20 +293,24 @@ pub(crate) fn amd(device: &ID3D12Device) -> bool {
     }
 }
 
-/// Whether a record that does not fit in what is left of its list's budget
-/// takes the rest, so that every record after it runs empty too
-/// (`VICTORY_INDIRECT_REST=0`: it takes nothing, and the next one that fits
-/// runs). A list whose budget one garbage record empties loses all its later
-/// draws, and which record that is may differ from frame to frame. The frame
-/// line says how many records a frame are refused.
-fn rest() -> u32 {
-    u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
+/// `VICTORY_INDIRECT_REST=1` restores charging the rest of the budget to
+/// a refused record. By default, later records can use whatever remains.
+fn rest_mode(setting: Option<&std::ffi::OsStr>) -> u32 {
+    u32::from(setting.is_some_and(|value| value == "1"))
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    let setting = std::env::var_os("VICTORY_INDIRECT_REST");
+    make_with_rest(device, source, rest_mode(setting.as_deref()))
+}
+
+fn make_with_rest(device: &ID3D12Device, source: &str, rest: u32) -> windows::core::Result<Clamp> {
+    let source = &format!(
+        "#define WIDEST {}u\n#define REST {rest}\n{source}",
+        widest(amd(device))
+    );
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -2578,44 +2582,57 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// word record by record, which of them fitted was up to the GPU.)
     #[test]
     fn warp_a_group_charges_its_records_in_lane_order() {
-        let Some((left, out)) = four_records_of_a_group(true) else {
-            return;
-        };
-        assert_eq!(out[0..4], [100, 1, 7, 9], "the first record fits");
-        for i in 1..4 {
-            assert_eq!(out[i * 4..i * 4 + 4], [0, 0, 7, 9], "record {i} runs empty");
+        let legacy = rest_mode(Some(std::ffi::OsStr::new("1")));
+        for batched in [false, true] {
+            let Some((left, refused, out)) = four_records_of_a_group(legacy, batched) else {
+                return;
+            };
+            assert_eq!(
+                out,
+                [[100, 1, 7, 9], [0, 0, 7, 9], [0, 0, 7, 9], [0, 0, 7, 9]]
+            );
+            assert_eq!(left, 0, "the record that did not fit took the rest");
+            assert_eq!(refused, 3);
         }
-        assert_eq!(left, 0, "the record that did not fit took the rest");
     }
 
-    /// As above where a record that does not fit takes nothing
-    /// (`VICTORY_INDIRECT_REST=0`): those after it that fit run.
+    /// By default, a rejected record leaves the budget for later draws.
     #[test]
-    fn warp_a_record_that_does_not_fit_may_take_nothing() {
-        let Some((left, out)) = four_records_of_a_group(false) else {
-            return;
-        };
-        for (i, count) in [100, 0, 50, 100].into_iter().enumerate() {
-            assert_eq!(out[i * 4..i * 4 + 4], [count, count.min(1), 7, 9], "record {i}");
+    fn warp_rejected_record_leaves_budget_for_later_draws() {
+        let default = rest_mode(None);
+        assert_eq!(default, 0);
+        assert_eq!(rest_mode(Some(std::ffi::OsStr::new("0"))), default);
+        for batched in [false, true] {
+            let Some((left, refused, out)) = four_records_of_a_group(default, batched) else {
+                return;
+            };
+            assert_eq!(
+                out,
+                [[100, 1, 7, 9], [0, 0, 7, 9], [50, 1, 7, 9], [100, 1, 7, 9]]
+            );
+            assert_eq!(left, 50);
+            assert_eq!(refused, 1);
         }
-        assert_eq!(left, 50);
     }
 
-    /// Draws of 100, 250, 50 and 100 with 300 left of the budget: what is
-    /// left then, and the records as clamped.
-    fn four_records_of_a_group(rest: bool) -> Option<(u32, Vec<u32>)> {
+    /// Remaining budget, refused count and clamp output for four draws
+    /// of 100, 250, 50 and 100 with 300 left of the budget.
+    fn four_records_of_a_group(rest: u32, batched: bool) -> Option<(u32, u32, [[u32; 4]; 4])> {
         let mut warp = WarpHarness::new()?;
-        let source = if rest { SOURCE.to_owned() } else { SOURCE.replace("REST ?", "false ?") };
-        let clamp = make_from(&warp.device, &source).expect("the clamp must compile on WARP");
+        let source = if batched { batch::SOURCE } else { SOURCE };
+        let clamp =
+            make_with_rest(&warp.device, source, rest).expect("the clamp must compile on WARP");
         const KIND_DRAW: u32 = 0;
         const STRIDE: u32 = 16;
         const BUDGET_CAP: u32 = 1 << 27;
         let counts = [100u32, 250, 50, 100];
-        let total = counts.len() * STRIDE as usize;
-        let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+        let out_stride = if batched { batch::SLOT } else { STRIDE };
+        let total = counts.len() as u64 * u64::from(out_stride);
+        let (src_buf, src_ptr, src_gpu) = warp.shared_buffer(total);
         let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
-        let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
-        let dst_buf = warp.default_uav(total as u64);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(total);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+        let dst_buf = warp.default_uav(total);
         // SAFETY: mapped buffers of these sizes.
         unsafe {
             for (i, &count) in counts.iter().enumerate() {
@@ -2629,16 +2646,35 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             std::ptr::write_bytes(budget_ptr, 0, 256);
             (budget_ptr as *mut u32).write_volatile(BUDGET_CAP - 300);
         }
-        assert!(record_clamp_as(
-            &clamp,
-            &warp.list,
-            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
-            budget_gpu,
-            (&src_buf, 0),
-            None,
-            (KIND_DRAW, STRIDE, counts.len() as u32),
-            false,
-        ));
+        if batched {
+            batch::record(
+                &clamp,
+                &warp.list,
+                (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
+                budget_gpu,
+                [src_gpu; 4],
+                table_gpu,
+            );
+            // SAFETY: the upload table is mapped and the list has not run.
+            let mut jobs = unsafe { batch::Table::new(table_ptr, 0, [1, 0, 0, 0]) };
+            for i in 0..counts.len() as u64 {
+                assert_eq!(
+                    jobs.place(1, i * u64::from(STRIDE), KIND_DRAW),
+                    Some(i * u64::from(batch::SLOT))
+                );
+            }
+        } else {
+            assert!(record_clamp_as(
+                &clamp,
+                &warp.list,
+                (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
+                budget_gpu,
+                (&src_buf, 0),
+                None,
+                (KIND_DRAW, STRIDE, counts.len() as u32),
+                false,
+            ));
+        }
         // SAFETY: an open list; the clamped records are copied for the check.
         unsafe {
             warp.list.ResourceBarrier(&[transition(
@@ -2646,18 +2682,22 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+            warp.list
+                .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total);
         }
         warp.submit_and_wait();
         // SAFETY: the work is done; mapped buffers.
-        let (spent, out) = unsafe {
-            (
-                (budget_ptr as *const u32).read_volatile(),
-                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4)
-                    .to_vec(),
-            )
+        let (spent, refused, out) = unsafe {
+            let budget = budget_ptr.cast::<u32>();
+            let out = std::array::from_fn(|i| {
+                readback_ptr
+                    .add(i * out_stride as usize)
+                    .cast::<[u32; 4]>()
+                    .read_volatile()
+            });
+            (budget.read_volatile(), budget.add(3).read_volatile(), out)
         };
-        Some((BUDGET_CAP - spent, out))
+        Some((BUDGET_CAP - spent, refused, out))
     }
 
     /// The list's budget starts empty at each submission, wherever it
@@ -2696,8 +2736,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             sig.unwrap()
         };
-        // Three records of 65,535 x 16 groups: about half the budget each.
-        let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
+        // Two records of 2^20 groups: exactly half the budget each.
+        let Some((big, big_ptr)) = host.shared_buffer(2 * u64::from(STRIDE)) else {
             return;
         };
         let Some((small, small_ptr)) = host.shared_buffer(u64::from(STRIDE)) else {
@@ -2708,8 +2748,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         };
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
-            for i in 0..3 {
-                let words = [65535u32, 16, 1];
+            for i in 0..2 {
+                let words = [32768u32, 32, 1];
                 std::ptr::copy_nonoverlapping(
                     words.as_ptr().cast::<u8>(),
                     big_ptr.add(i * STRIDE as usize),
@@ -2723,7 +2763,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
             // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
+            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 2)).unwrap();
             let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
@@ -3152,8 +3192,8 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
-        const BUDGET: u32 = 1 << 27;
+        let pass = make_with_rest(&warp.device, batch::SOURCE, rest_mode(None))
+            .expect("the batched clamp must compile on WARP");
         // 2^26 vertices each, as much as a draw is let run: two fill it.
         for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
             let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
@@ -3192,7 +3232,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            assert_eq!(spent, (1 << 26) * times * filled as u32);
         }
     }
 
