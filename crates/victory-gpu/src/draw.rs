@@ -3784,13 +3784,14 @@ impl State {
             let recording = self.recording;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
+            let mut copy_batch = crate::descriptor::host::CopyBatch::new();
             for k in 0..n {
                 let index = first + k;
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
+                    && let Some(mut listed) = host.make_listed_batched(recording, words, index, &mut copy_batch)
                 {
                     let kind = group
                         .entry(k)
@@ -3887,6 +3888,7 @@ impl State {
                     }
                 }
             }
+            copy_batch.flush();
             made.push((slot, first * 32));
         }
         made

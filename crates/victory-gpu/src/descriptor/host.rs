@@ -134,6 +134,7 @@ pub(crate) struct HostHeap {
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
@@ -1766,6 +1767,7 @@ impl HostHeap {
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
             cpu,
+            gpu,
             step,
             count,
             dynamic: extra,
@@ -2837,13 +2839,78 @@ impl HostHeap {
         self.twin_made(index, kept.is_some() && twinned(view));
         self.keep(index, kept.flatten());
     }
+}
 
-    /// Makes slot `index` (a dynamic one) the view the record `words` names,
-    /// from this thread's descriptor of it if the recording `recording` has
-    /// made one, else as [`HostHeap::make_at`] does, and keeps that
-    /// ([`ListViews`]). What is known of the record in this recording;
-    /// `None` (the slot is not made): not a view kept so.
-    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+/// Stack-allocated batch of 1-descriptor CBV/SRV/UAV copies for a single fresh
+/// descriptor table, flushed with one `ID3D12Device::CopyDescriptors` call
+/// instead of `2 * n` individual `CopyDescriptorsSimple(1, ...)` COM calls.
+pub(crate) struct CopyBatch {
+    dst: [D3D12_CPU_DESCRIPTOR_HANDLE; 64],
+    src: [D3D12_CPU_DESCRIPTOR_HANDLE; 64],
+    len: usize,
+}
+
+impl CopyBatch {
+    pub(crate) fn new() -> Self {
+        Self {
+            dst: [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 64],
+            src: [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 64],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, to: D3D12_CPU_DESCRIPTOR_HANDLE, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        if self.len == self.dst.len() {
+            self.flush();
+        }
+        self.dst[self.len] = to;
+        self.src[self.len] = from;
+        self.len += 1;
+    }
+
+    pub(crate) fn flush(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        let n = self.len as u32;
+        self.len = 0;
+        let Some(host) = host() else { return };
+        // SAFETY: `self.dst[..n]` and `self.src[..n]` hold live CBV/SRV/UAV
+        // descriptor handles; `None` range sizes mean 1 descriptor per range.
+        unsafe {
+            if n == 1 {
+                host.device.CopyDescriptorsSimple(
+                    1,
+                    self.dst[0],
+                    self.src[0],
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
+            } else {
+                host.device.CopyDescriptors(
+                    n,
+                    self.dst.as_ptr(),
+                    None,
+                    n,
+                    self.src.as_ptr(),
+                    None,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
+            }
+        }
+    }
+}
+
+impl HostHeap {
+    /// As [`HostHeap::make_listed`], batching descriptor copies into `batch`
+    /// and avoiding a duplicate HashMap lookup on cache hit.
+    pub(crate) fn make_listed_batched(
+        &self,
+        recording: u64,
+        words: [u32; 3],
+        index: u32,
+        batch: &mut CopyBatch,
+    ) -> Option<Listed> {
         if self.sampler {
             return None;
         }
@@ -2858,7 +2925,11 @@ impl HostHeap {
                 views.made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
+            let (vstart, vstep) = (views.start, views.step);
+            let slot_handle = |at: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: vstart + at as usize * vstep };
+            let made = if let Some(made) = views.made.get(&words) {
+                made
+            } else {
                 let view = super::view_at(words[1], words[2])?;
                 let at = 2 * views.made.len() as u32;
                 // (A constant buffer's bytes are copied for each draw.)
@@ -2866,19 +2937,26 @@ impl HostHeap {
                     return None;
                 }
                 let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let kept = make_twinned(&view, slot_handle(at), Some(slot_handle(at + 1)))?;
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, kept, listed });
+                views.made.entry(words).or_insert(ListView { view, at, twin, kept, listed })
+            };
+            #[cfg(feature = "diagnostics")]
+            if let Some(written) = self.written.get(index as usize) {
+                written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
             }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
+            batch.push(self.cpu(index), slot_handle(made.at));
             if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
+                #[cfg(feature = "diagnostics")]
+                if let Some(written) = self.written.get((self.raw + index) as usize) {
+                    written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+                }
+                batch.push(self.cpu(self.raw + index), slot_handle(made.at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
             } else {
                 self.clear_twin(index);
@@ -2886,18 +2964,6 @@ impl HostHeap {
             self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
         })
-    }
-
-    /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
-    /// see.
-    fn copy_from(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
-        #[cfg(feature = "diagnostics")]
-        if let Some(written) = self.written.get(to as usize) {
-            written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
-        }
-        let Some(host) = host() else { return };
-        // SAFETY: a slot of our heap, and one of this thread's heap.
-        unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -3112,10 +3178,8 @@ impl HostHeap {
 
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 
@@ -6318,7 +6382,7 @@ struct ListView {
 /// copies its descriptor.
 struct ListViews {
     recording: u64,
-    heap: ID3D12DescriptorHeap,
+    _heap: ID3D12DescriptorHeap,
     step: usize,
     start: usize,
     made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -6341,13 +6405,8 @@ impl ListViews {
                 .ok()?;
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
-            Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
+            Some(ListViews { recording: 0, _heap: heap, step, start, made: Default::default() })
         }
-    }
-
-    fn slot(&self, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        debug_assert!(i < Self::SLOTS && !windows::core::Interface::as_raw(&self.heap).is_null());
-        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + i as usize * self.step }
     }
 }
 
