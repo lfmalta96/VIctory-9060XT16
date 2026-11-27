@@ -278,22 +278,31 @@ static FACTORY_VTABLE: Methods<16> = Methods([
     missing::<15> as *const (),
 ]);
 
-// Decompressed block disk cache (`VICTORY_DSTORAGE_CACHE_MB=<MiB>`, off by default).
+// Decompressed block single-file pack cache (`VICTORY_DSTORAGE_CACHE_MB=<MiB>`, off by default).
+// Stores all decompressed blocks in one append-only `cache.dat` + 28-byte-per-entry `cache.idx`
+// loaded into RAM on startup, so cache hits do lock-free `seek_read` with zero NTFS open/close overhead.
 mod disk_cache {
-    use std::io::Read;
+    use std::collections::HashMap;
+    use std::fs::{File, OpenOptions};
+    use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+    use std::os::windows::fs::FileExt;
     use std::path::PathBuf;
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::{Mutex, OnceLock, RwLock};
 
     use super::{BCPACK, Request, ZLIB};
 
+    const IDX_REC: usize = 28; // key: u128 (16) + offset: u64 (8) + len: u32 (4)
+    const MAX_QUEUED_BYTES: u64 = 256 << 20;
+
     struct WriteJob {
-        key: Key,
+        key: u128,
         data: Vec<u8>,
     }
 
     struct Config {
-        dir: PathBuf,
+        reader: File,
+        index: RwLock<HashMap<u128, (u64, u32)>>,
         max_bytes: u64,
         used_bytes: AtomicU64,
         hits: AtomicU64,
@@ -301,11 +310,33 @@ mod disk_cache {
         hit_bytes: AtomicU64,
         stored_bytes: AtomicU64,
         queued_bytes: AtomicU64,
-        writer: std::sync::Mutex<std::sync::mpsc::Sender<WriteJob>>,
+        writer: Mutex<std::sync::mpsc::Sender<WriteJob>>,
     }
 
-    /// Cap queued background writes in RAM (256 MiB) so cold runs never spike memory.
-    const MAX_QUEUED_BYTES: u64 = 256 << 20;
+    fn load_index(idx_path: &PathBuf, max_bytes: u64) -> (HashMap<u128, (u64, u32)>, u64) {
+        let mut map = HashMap::new();
+        let mut high_water = 0u64;
+        let Ok(mut f) = File::open(idx_path) else { return (map, 0) };
+        let mut buf = Vec::new();
+        if f.read_to_end(&mut buf).is_err() {
+            return (map, 0);
+        }
+        let count = buf.len() / IDX_REC;
+        map.reserve(count);
+        for chunk in buf.chunks_exact(IDX_REC) {
+            let key = u128::from_le_bytes(chunk[0..16].try_into().unwrap());
+            let offset = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
+            let len = u32::from_le_bytes(chunk[24..28].try_into().unwrap());
+            let end = offset.saturating_add(u64::from(len));
+            if len > 0 && end <= max_bytes {
+                map.insert(key, (offset, len));
+                if end > high_water {
+                    high_water = end;
+                }
+            }
+        }
+        (map, high_water)
+    }
 
     fn config() -> Option<&'static Config> {
         static CFG: OnceLock<Option<Config>> = OnceLock::new();
@@ -330,64 +361,76 @@ mod disk_cache {
             if std::fs::create_dir_all(&dir).is_err() {
                 return None;
             }
-            let mut existing = 0u64;
-            if let Ok(shards) = std::fs::read_dir(&dir) {
-                for shard in shards.flatten() {
-                    if let Ok(entries) = std::fs::read_dir(shard.path()) {
-                        for entry in entries.flatten() {
-                            if let Ok(meta) = entry.metadata() {
-                                existing = existing.saturating_add(meta.len());
-                            }
-                        }
-                    }
-                }
-            }
             let max_bytes = mb << 20;
+            let dat_path = dir.join("cache.dat");
+            let idx_path = dir.join("cache.idx");
+            let mut dat_writer = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&dat_path).ok()?;
+            // Pre-allocate the single pack file to `max_bytes` so writes never stall extending NTFS.
+            let cur_len = dat_writer.metadata().map(|m| m.len()).unwrap_or(0);
+            if cur_len < max_bytes {
+                let _ = dat_writer.set_len(max_bytes);
+            }
+            let (index, used) = load_index(&idx_path, max_bytes);
+            let entries = index.len();
+            dat_writer.seek(SeekFrom::Start(used)).ok()?;
+            let reader = OpenOptions::new().read(true).open(&dat_path).ok()?;
+            let idx_file = OpenOptions::new().create(true).append(true).open(&idx_path).ok()?;
             let (tx, rx) = std::sync::mpsc::channel::<WriteJob>();
-            let writer_dir = dir.clone();
             let _ = std::thread::Builder::new().name("dstorage-cache-writer".into()).spawn(move || {
+                // Write directly to `dat_writer` (OS page cache) so concurrent `seek_read`
+                // hits see the bytes immediately once inserted into `cfg.index`.
+                let mut idx_out = BufWriter::with_capacity(256 << 10, idx_file);
+                let mut write_pos = used;
+                let mut since_flush = 0usize;
                 while let Ok(job) = rx.recv() {
                     let len = job.data.len() as u64;
                     let Some(cfg) = config() else { continue };
-                    let shard_dir = writer_dir.join(format!("{:02x}", job.key.shard));
-                    let _ = std::fs::create_dir_all(&shard_dir);
-                    let final_path = shard_dir.join(&job.key.name);
-                    if final_path.exists() {
+                    let already = cfg.index.read().unwrap_or_else(|e| e.into_inner()).contains_key(&job.key);
+                    if already {
                         cfg.used_bytes.fetch_sub(len, Relaxed);
                         cfg.queued_bytes.fetch_sub(len, Relaxed);
                         continue;
                     }
-                    let tmp_path = shard_dir.join(format!("{}.tmp", job.key.name));
-                    if std::fs::write(&tmp_path, &job.data).is_ok() {
-                        if std::fs::rename(&tmp_path, &final_path).is_ok() {
-                            cfg.stored_bytes.fetch_add(len, Relaxed);
-                        } else {
-                            let _ = std::fs::remove_file(&tmp_path);
-                            cfg.used_bytes.fetch_sub(len, Relaxed);
+                    let offset = write_pos;
+                    if dat_writer.write_all(&job.data).is_ok() {
+                        write_pos += len;
+                        let mut rec = [0u8; IDX_REC];
+                        rec[0..16].copy_from_slice(&job.key.to_le_bytes());
+                        rec[16..24].copy_from_slice(&offset.to_le_bytes());
+                        rec[24..28].copy_from_slice(&(len as u32).to_le_bytes());
+                        let _ = idx_out.write_all(&rec);
+                        since_flush += 1;
+                        if since_flush >= 64 {
+                            let _ = idx_out.flush();
+                            since_flush = 0;
                         }
+                        cfg.index.write().unwrap_or_else(|e| e.into_inner()).insert(job.key, (offset, len as u32));
+                        cfg.stored_bytes.fetch_add(len, Relaxed);
                     } else {
-                        let _ = std::fs::remove_file(&tmp_path);
                         cfg.used_bytes.fetch_sub(len, Relaxed);
                     }
                     cfg.queued_bytes.fetch_sub(len, Relaxed);
                 }
+                let _ = idx_out.flush();
             });
             tracing::info!(
                 dir = %dir.display(),
-                existing_mb = existing >> 20,
+                entries,
+                existing_mb = used >> 20,
                 max_mb = mb,
-                "dstorage: decompressed block disk cache enabled (VICTORY_DSTORAGE_CACHE_MB)"
+                "dstorage: pre-allocated single-file pack cache enabled (VICTORY_DSTORAGE_CACHE_MB)"
             );
             Some(Config {
-                dir,
+                reader,
+                index: RwLock::new(index),
                 max_bytes,
-                used_bytes: AtomicU64::new(existing),
+                used_bytes: AtomicU64::new(used),
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
                 hit_bytes: AtomicU64::new(0),
                 stored_bytes: AtomicU64::new(0),
                 queued_bytes: AtomicU64::new(0),
-                writer: std::sync::Mutex::new(tx),
+                writer: Mutex::new(tx),
             })
         })
         .as_ref()
@@ -424,22 +467,12 @@ mod disk_cache {
         (h1, h2)
     }
 
-    pub(super) struct Key {
-        shard: u8,
-        name: String,
-    }
-
-    pub(super) fn key(file_hash: (u64, u64), req: &Request) -> Key {
+    pub(super) fn key(file_hash: (u64, u64), req: &Request) -> u128 {
         let mut h1 = file_hash.0 ^ req.offset.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         h1 = mix(h1 ^ u64::from(req.source_size) ^ (u64::from(req.destination_size) << 32));
         let mut h2 = file_hash.1 ^ req.offset.rotate_left(23);
         h2 = mix(h2 ^ (req.options & (ZLIB | BCPACK)) ^ u64::from(req.intermediate_size).rotate_left(11));
-        let shard = (h1 & 0xff) as u8;
-        Key { shard, name: format!("{h1:016x}{h2:016x}") }
-    }
-
-    fn path_for(cfg: &Config, k: &Key) -> PathBuf {
-        cfg.dir.join(format!("{:02x}", k.shard)).join(&k.name)
+        u128::from(h1) | (u128::from(h2) << 64)
     }
 
     fn maybe_log(cfg: &Config) {
@@ -457,21 +490,27 @@ mod disk_cache {
         }
     }
 
-    pub(super) fn open_hit(k: &Key, max_out: usize) -> Option<(std::fs::File, usize)> {
+    pub(super) fn lookup(k: u128, max_out: usize) -> Option<(u64, usize)> {
         let cfg = config()?;
-        let path = path_for(cfg, k);
-        let file = std::fs::File::open(path).ok()?;
-        let len = file.metadata().ok()?.len() as usize;
+        let &(offset, len) = cfg.index.read().unwrap_or_else(|e| e.into_inner()).get(&k)?;
+        let len = len as usize;
         if len == 0 || len > max_out {
             return None;
         }
-        Some((file, len))
+        Some((offset, len))
     }
 
-    pub(super) fn read_hit(mut file: std::fs::File, len: usize, out: &mut [u8]) -> Option<usize> {
+    pub(super) fn read_hit(offset: u64, len: usize, out: &mut [u8]) -> Option<usize> {
         let cfg = config()?;
-        if out.len() < len || file.read_exact(&mut out[..len]).is_err() {
+        if out.len() < len {
             return None;
+        }
+        let mut done = 0usize;
+        while done < len {
+            match cfg.reader.seek_read(&mut out[done..len], offset + done as u64) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => done += n,
+            }
         }
         cfg.hits.fetch_add(1, Relaxed);
         cfg.hit_bytes.fetch_add(len as u64, Relaxed);
@@ -479,26 +518,24 @@ mod disk_cache {
         Some(len)
     }
 
-    pub(super) fn write(k: &Key, data: &[u8]) {
+    pub(super) fn write(k: u128, data: &[u8]) {
         let Some(cfg) = config() else { return };
         cfg.misses.fetch_add(1, Relaxed);
         maybe_log(cfg);
-        if data.is_empty() {
+        if data.is_empty() || data.len() > u32::MAX as usize {
             return;
         }
         let len = data.len() as u64;
-        // Skip if background write queue is full so cold runs stay smooth and RAM stays bounded.
         if cfg.queued_bytes.load(Relaxed).saturating_add(len) > MAX_QUEUED_BYTES {
             return;
         }
-        // Reserve disk capacity atomically so we never exceed `max_bytes`.
         let prev = cfg.used_bytes.fetch_add(len, Relaxed);
         if prev.saturating_add(len) > cfg.max_bytes {
             cfg.used_bytes.fetch_sub(len, Relaxed);
             return;
         }
         cfg.queued_bytes.fetch_add(len, Relaxed);
-        let job = WriteJob { key: Key { shard: k.shard, name: k.name.clone() }, data: data.to_vec() };
+        let job = WriteJob { key: k, data: data.to_vec() };
         if cfg.writer.lock().unwrap_or_else(|e| e.into_inner()).send(job).is_err() {
             cfg.used_bytes.fetch_sub(len, Relaxed);
             cfg.queued_bytes.fetch_sub(len, Relaxed);
@@ -1713,12 +1750,12 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         None
     };
-    if let Some(ref k) = cache_key
-        && let Some((file, len)) = disk_cache::open_hit(k, size)
+    if let Some(k) = cache_key
+        && let Some((offset, len)) = disk_cache::lookup(k, size)
     {
         let mut ok = false;
         let res = into_destination(request, size, |out| {
-            if let Some(n) = disk_cache::read_hit(file.try_clone().map_err(|_| INVALID_DATA)?, len, out) {
+            if let Some(n) = disk_cache::read_hit(offset, len, out) {
                 ok = true;
                 Ok(n)
             } else {
@@ -1750,7 +1787,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
                 .map_err(|e| fail(INVALID_DATA, &e.to_string()))?,
             None => inflate(&source, out).map_err(|hr| fail(hr, "zlib"))?,
         };
-        if let Some(ref k) = cache_key {
+        if let Some(k) = cache_key {
             disk_cache::write(k, &out[..written]);
         }
         Ok(written)
