@@ -282,10 +282,11 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Stores all decompressed blocks in one append-only `cache.dat` + 28-byte-per-entry `cache.idx`
 // loaded into RAM on startup, so cache hits do lock-free `seek_read` with zero NTFS open/close overhead.
 mod disk_cache {
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::fs::{File, OpenOptions};
     use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-    use std::os::windows::fs::FileExt;
+    use std::os::windows::fs::{FileExt, OpenOptionsExt};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::sync::{Mutex, OnceLock, RwLock};
@@ -294,6 +295,13 @@ mod disk_cache {
 
     const IDX_REC: usize = 28; // key: u128 (16) + offset: u64 (8) + len: u32 (4)
     const MAX_QUEUED_BYTES: u64 = 256 << 20;
+    const FILE_FLAG_RANDOM_ACCESS: u32 = 0x1000_0000;
+
+    thread_local! {
+        // One synchronous handle per worker avoids Windows serializing
+        // `ReadFile` on a shared `FILE_OBJECT`, enabling true concurrent queue depth.
+        static READER: RefCell<Option<File>> = const { RefCell::new(None) };
+    }
 
     struct WriteJob {
         key: u128,
@@ -301,7 +309,7 @@ mod disk_cache {
     }
 
     struct Config {
-        reader: File,
+        dat_path: PathBuf,
         index: RwLock<HashMap<u128, (u64, u32)>>,
         max_bytes: u64,
         used_bytes: AtomicU64,
@@ -373,7 +381,8 @@ mod disk_cache {
             let (index, used) = load_index(&idx_path, max_bytes);
             let entries = index.len();
             dat_writer.seek(SeekFrom::Start(used)).ok()?;
-            let reader = OpenOptions::new().read(true).open(&dat_path).ok()?;
+            // Verify the pack file can be opened independently for concurrent worker reads.
+            OpenOptions::new().read(true).custom_flags(FILE_FLAG_RANDOM_ACCESS).open(&dat_path).ok()?;
             let idx_file = OpenOptions::new().create(true).append(true).open(&idx_path).ok()?;
             let (tx, rx) = std::sync::mpsc::channel::<WriteJob>();
             let _ = std::thread::Builder::new().name("dstorage-cache-writer".into()).spawn(move || {
@@ -400,7 +409,7 @@ mod disk_cache {
                         rec[24..28].copy_from_slice(&(len as u32).to_le_bytes());
                         let _ = idx_out.write_all(&rec);
                         since_flush += 1;
-                        if since_flush >= 64 {
+                        if since_flush >= 32 {
                             let _ = idx_out.flush();
                             since_flush = 0;
                         }
@@ -421,7 +430,7 @@ mod disk_cache {
                 "dstorage: pre-allocated single-file pack cache enabled (VICTORY_DSTORAGE_CACHE_MB)"
             );
             Some(Config {
-                reader,
+                dat_path,
                 index: RwLock::new(index),
                 max_bytes,
                 used_bytes: AtomicU64::new(used),
@@ -505,12 +514,29 @@ mod disk_cache {
         if out.len() < len {
             return None;
         }
-        let mut done = 0usize;
-        while done < len {
-            match cfg.reader.seek_read(&mut out[done..len], offset + done as u64) {
-                Ok(0) | Err(_) => return None,
-                Ok(n) => done += n,
+        let ok = READER.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(FILE_FLAG_RANDOM_ACCESS)
+                    .open(&cfg.dat_path)
+                    .ok();
             }
+            let Some(file) = slot.as_ref() else {
+                return false;
+            };
+            let mut done = 0usize;
+            while done < len {
+                match file.seek_read(&mut out[done..len], offset + done as u64) {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) => done += n,
+                }
+            }
+            true
+        });
+        if !ok {
+            return None;
         }
         cfg.hits.fetch_add(1, Relaxed);
         cfg.hit_bytes.fetch_add(len as u64, Relaxed);
