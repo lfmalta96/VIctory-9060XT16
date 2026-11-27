@@ -61,12 +61,18 @@ impl FsrPreset {
         }
     }
 
-    pub(super) fn render_size(self) -> [u32; 2] {
-        [3840.0, 2160.0].map(|size| (size * self.render_scale()) as u32)
+    pub(super) fn render_size_for(self, output: (u32, u32), scale_override: Option<f32>) -> [u32; 2] {
+        let scale = scale_override.unwrap_or_else(|| self.render_scale());
+        [output.0 as f32, output.1 as f32].map(|size| (size * scale).round() as u32)
     }
 }
 
-pub(super) fn prepare_fsr_4k(image: &mut PreparedImage, preset: FsrPreset) -> Result<()> {
+pub(super) fn prepare_fsr_4k(
+    image: &mut PreparedImage,
+    preset: FsrPreset,
+    output: (u32, u32),
+    scale_override: Option<f32>,
+) -> Result<()> {
     ensure!(
         image.original_hash.to_hex().as_str() == RETAIL_BUILD,
         "FSR at 4K is unavailable for this retail game build"
@@ -92,7 +98,9 @@ pub(super) fn prepare_fsr_4k(image: &mut PreparedImage, preset: FsrPreset) -> Re
     );
     const NATIVE_LOAD: u32 = 0x028e_f6a8;
     const QUALITY_LOAD: u32 = 0x028e_f6b2;
-    if preset != FsrPreset::Quality {
+    let scale = scale_override.unwrap_or_else(|| preset.render_scale());
+    let patch_scale = preset != FsrPreset::Quality || scale_override.is_some();
+    if patch_scale {
         ensure!(
             *field::<10>(image, NATIVE_LOAD)?
                 == [0xc5, 0xfa, 0x10, 0x05, 0x28, 0x78, 0x6d, 0x03, 0xeb, 0x08]
@@ -121,12 +129,12 @@ pub(super) fn prepare_fsr_4k(image: &mut PreparedImage, preset: FsrPreset) -> Re
         0xeb,
         0x0a,
     ];
-    if preset != FsrPreset::Quality {
+    if patch_scale {
         // The jump makes the native-scale instruction unreachable. Reuse
         // its RIP operand bytes for a private literal, leaving the constants
         // used by other passes unchanged.
         let local_scale = NATIVE_LOAD + 4;
-        *field::<4>(image, local_scale)? = preset.render_scale().to_le_bytes();
+        *field::<4>(image, local_scale)? = scale.to_le_bytes();
         let displacement = local_scale as i32 - (QUALITY_LOAD as i32 + 8);
         *field::<4>(image, QUALITY_LOAD + 4)? = displacement.to_le_bytes();
     }
@@ -134,9 +142,10 @@ pub(super) fn prepare_fsr_4k(image: &mut PreparedImage, preset: FsrPreset) -> Re
         renderer = 7,
         preset = preset.name(),
         quality = preset.mode(),
-        expected_render = ?preset.render_size(),
-        output = ?[3840, 2160],
-        "Selected Series X FSR with the stock 4K frontend"
+        scale,
+        expected_render = ?preset.render_size_for(output, scale_override),
+        output = ?[output.0, output.1],
+        "Selected Series X PC FidelityFX FSR"
     );
     Ok(())
 }
@@ -172,7 +181,7 @@ mod tests {
             let mut image = victory_loader::prepare(&bytes).unwrap();
             let scanout = *field::<5>(&mut image, 0x0247_ad4a).unwrap();
             let settings = *field::<8>(&mut image, 0x0580_48d4).unwrap();
-            prepare_fsr_4k(&mut image, preset).unwrap();
+            prepare_fsr_4k(&mut image, preset, (3840, 2160), None).unwrap();
             assert_eq!(*field::<16>(&mut image, SDR_MODE).unwrap(), STOCK_SDR_MODE);
             assert_eq!(*field::<5>(&mut image, 0x0247_ad4a).unwrap(), scanout);
             assert_eq!(*field::<8>(&mut image, 0x0580_48d4).unwrap(), settings);
@@ -184,7 +193,7 @@ mod tests {
                 *field::<4>(&mut image, 0x028e_f69b).unwrap(),
                 u32::from(preset.mode()).to_le_bytes()
             );
-            assert_eq!(preset.render_size(), size);
+            assert_eq!(preset.render_size_for((3840, 2160), None), size);
             let disp = i32::from_le_bytes(*field::<4>(&mut image, 0x028e_f6b6).unwrap());
             let reference = 0x028e_f6ba_u32.wrapping_add_signed(disp);
             let scale = f32::from_le_bytes(*field::<4>(&mut image, reference).unwrap());

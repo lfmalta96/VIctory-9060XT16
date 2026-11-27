@@ -289,6 +289,31 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
     Patched::Done
 }
 
+/// Applies only the output size patch (`VICTORY_OUTPUT`), leaving upscaler
+/// selection and render-scale instructions untouched (used with host FSR).
+///
+/// # Safety
+/// The image of `size` bytes at `base` stays mapped and no thread runs its
+/// code yet.
+#[cfg(windows)]
+pub unsafe fn apply_output(base: usize, size: usize, (w, h): (u32, u32)) {
+    let mut asked: Vec<(&Site, Vec<u8>, String)> = vec![(&OUTPUT, output_code(w, h), format!("{w}x{h}"))];
+    if (w, h) != (3840, 2160) {
+        asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
+    }
+    for (site, code, value) in asked {
+        // SAFETY: the caller's promise.
+        let done = unsafe { write(base, size, site, &code) };
+        let offset = format!("{:#x}", site.at);
+        match done {
+            Patched::Done => tracing::info!(site = %offset, what = site.what, value, "resolution: patched"),
+            Patched::Differs => tracing::warn!(site = %offset, what = site.what, "resolution: not patched, the title's bytes there are not the ones expected (another build?)"),
+            Patched::Failed(why) => tracing::warn!(site = %offset, what = site.what, why, "resolution: not patched"),
+        }
+        println!("resolution: {} ({value}) at title+{offset}: {done:?}", site.what);
+    }
+}
+
 /// Applies what the switches ask for; a line each in the log and on
 /// standard output.
 ///

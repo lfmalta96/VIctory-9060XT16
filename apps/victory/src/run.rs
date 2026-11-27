@@ -68,9 +68,12 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let fsr_output = victory_loader::resolution::asked_output();
     let image = if let Some(preset) = fsr {
         anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
-        fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
+        let output = fsr_output.unwrap_or((3840, 2160));
+        let scale_override = victory_loader::resolution::asked_ffx_scale();
+        fsr_4k::prepare_fsr_4k(&mut prepared, preset, output, scale_override)?;
         let dir = cfg.fidelityfx_dir.as_deref().context(
             "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
         )?;
@@ -80,8 +83,16 @@ pub fn run(
             .with_context(|| format!("loading the PC FSR upscaler from {}", dir.display()))?;
         // SAFETY: Windows supports setting the environment across threads.
         // No title code has run or queried DXGI yet.
-        unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160") };
-        let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
+        unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", format!("{}x{}", output.0, output.1)) };
+        let cache_name = if output == (3840, 2160) && scale_override.is_none() {
+            format!("images/fsr-{}-4k-sdr", preset.name())
+        } else {
+            let scale_tag = scale_override
+                .map(|s| format!("-s{}", (s * 1000.0).round() as u32))
+                .unwrap_or_default();
+            format!("images/fsr-{}-{}x{}{scale_tag}", preset.name(), output.0, output.1)
+        };
+        let cache = cfg.cache_subdir(&cache_name)?;
         victory_loader::load(&prepared, &cache)?
     } else {
         victory_loader::load(&prepared, &images)?
@@ -231,10 +242,15 @@ pub fn run(
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
     // VICTORY_UPSCALER; each off without it).
     #[cfg(windows)]
-    if execute && fsr.is_none() {
+    if execute {
         let size = image.info().size_of_image as usize;
-        // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        if fsr.is_none() {
+            // SAFETY: the image stays mapped and nothing of it has run yet.
+            unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        } else if let Some(output) = fsr_output {
+            // SAFETY: the image stays mapped and nothing of it has run yet.
+            unsafe { victory_loader::resolution::apply_output(image.base(), size, output) };
+        }
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
