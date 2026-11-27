@@ -761,8 +761,21 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     ask_ahead_held(ranges, false);
 }
 
+/// Fast-path mirror of `journal().kept` so callers skip building/sorting
+/// `ask_ahead` range lists on every flush while `ask_once` stands.
+static AHEAD_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn ahead_kept() -> bool {
+    AHEAD_KEPT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
 fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
+    // The submission's one asking stands ([`ask_once`]): what it does not
+    // hold is left to `writes`. Check before filtering/sorting every range.
+    if AHEAD_KEPT.load(std::sync::atomic::Ordering::Acquire) || journal().kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -774,11 +787,6 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         return;
     }
     pieces.sort_unstable();
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if journal().kept {
-        return;
-    }
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut runs = Vec::new();
@@ -1105,6 +1113,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         let mut j = journal_mut();
         j.ahead_asked = now;
         j.kept = !ahead.is_empty();
+        AHEAD_KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
         j.ahead.set(ahead);
         return;
     }
@@ -1115,6 +1124,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         j.notes.note(page, parts, now);
     }
     j.kept = !ahead.is_empty();
+    AHEAD_KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
     j.ahead.set(ahead);
 }
 
@@ -1170,6 +1180,7 @@ pub(crate) fn ask_once_end() {
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
+        AHEAD_KEPT.store(false, std::sync::atomic::Ordering::Release);
         j.ahead.clear();
     }
 }

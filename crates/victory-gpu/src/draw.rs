@@ -1084,14 +1084,36 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
     // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
+    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+        std::collections::HashMap::with_capacity_and_hasher(512, Default::default());
     let mut views = 0u32;
+    let mut last_key = 0usize;
+    let mut last_range = (0u64, 0u64);
     for (shadow, from, to) in ranges.ranges() {
         views += 1;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if key == last_key {
+            last_range.0 = last_range.0.min(*from);
+            last_range.1 = last_range.1.max(*to);
+            continue;
+        }
+        if last_key != 0 {
+            if let Some(span) = spans.get_mut(&last_key) {
+                span.1 = span.1.min(last_range.0);
+                span.2 = span.2.max(last_range.1);
+            }
+        }
         let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
         span.1 = span.1.min(*from);
         span.2 = span.2.max(*to);
+        last_key = key;
+        last_range = (span.1, span.2);
+    }
+    if last_key != 0 {
+        if let Some(span) = spans.get_mut(&last_key) {
+            span.1 = span.1.min(last_range.0);
+            span.2 = span.2.max(last_range.1);
+        }
     }
     let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
