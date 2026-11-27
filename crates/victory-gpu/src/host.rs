@@ -2638,6 +2638,9 @@ struct CardPlan {
     sends: Option<send::Memory>,
     /// With [`upq`]: the copy list and buffer what went up came through.
     up: Option<upq::Slot>,
+    /// With [`relay_copy`]: the copies the submission writes on the card,
+    /// counted until it is done with ([`fetchguard`]).
+    writes: Option<fetchguard::Writes>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -3848,6 +3851,9 @@ struct RelayFetch {
     event: HANDLE,
     /// The last value signalled on `fence`.
     sent: u64,
+    /// With [`relay_copy`]: a list for the drawing queue, for a fetch that
+    /// goes there ([`fetchguard`]).
+    drawing: Option<Prelude>,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
     /// Pieces caught while a later flight was writing them.
@@ -4089,6 +4095,16 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[4] / 1000.0,
         );
+        if relay_copy() {
+            let g: Vec<f64> = fetchguard::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            tracing::info!(
+                "fetches of card copies' pieces per frame (VICTORY_RELAY_COPY=1): {:.1} on the copy queue, {:.1} on the drawing \
+                 queue behind a submission in the air that writes the same copies; {:.1} waits of the drawing queue for a fetch",
+                g[0],
+                g[1],
+                g[2],
+            );
+        }
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
@@ -4157,6 +4173,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod fetchguard;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 mod panel;
@@ -4767,6 +4784,13 @@ impl Host {
                 }
             }
         }
+        // With the fetch on the copy queue: counted before anything of this
+        // submission goes to the drawing queue, which waits here for a fetch
+        // reading one of these copies ([`fetchguard`]).
+        let writes = (relay() && relay_copy()).then(|| {
+            let copies = declared.iter().map(|d| d.0.id()).chain(looked.iter().map(|l| l.0.id())).chain(dirty.iter().map(|d| d.0.id()));
+            fetchguard::writing(&self.queue, copies.collect())
+        });
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
         let mut up = None;
@@ -4911,6 +4935,7 @@ impl Host {
             looks,
             sends: own.map(send::Own::memory),
             up,
+            writes,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -5087,6 +5112,7 @@ impl Host {
                 fence,
                 event,
                 sent: 0,
+                drawing: None,
                 buffer: None,
                 suspects: torn::Suspects::default(),
                 had: crate::land::Had::default(),
@@ -5192,9 +5218,23 @@ impl Host {
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
         }
+        // The copy queue only for copies nothing in the air writes; a
+        // submission sent meanwhile that writes one waits for the fetch
+        // ([`fetchguard`]). Else the drawing queue, behind those writes.
+        let copying = !pieces.is_empty()
+            && fetch.as_mut().is_some_and(|f| {
+                f.queue.is_some()
+                    && fetchguard::may_copy(
+                        pieces.iter().map(|p| p.0.id()),
+                        plans.iter().filter_map(|p| p.0.writes.as_ref()),
+                        &f.fence,
+                        f.sent + 1,
+                    )
+            });
         // On the copy queue a later flight may be at a piece while it is
-        // fetched: the pieces come down whole, to be hashed.
-        let check = (torn::on() && fetch.as_ref().is_some_and(|f| f.queue.is_some()))
+        // fetched (not since `fetchguard`, unless it writes what it did not
+        // declare): the pieces come down whole, to be hashed.
+        let check = (torn::on() && copying)
             .then(|| torn::Check::new(plans.iter().map(|p| p.0), differs.unwrap_or_default(), &mut pieces));
         if let Some(check) = &check {
             total = check.total;
@@ -5227,8 +5267,22 @@ impl Host {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
         f.sent += 1;
-        let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
-        let copy_queue = f.queue.clone();
+        let copy_queue = if copying { f.queue.clone() } else { None };
+        let list = match (&f.queue, copying) {
+            // The drawing queue takes a list of its own type.
+            (Some(_), false) => match &f.drawing {
+                Some(list) => list.clone(),
+                None => {
+                    let Some(list) = self.make_prelude() else {
+                        fail(format_args!("no list to fetch what shaders wrote to the card's memory on the drawing queue"));
+                    };
+                    f.drawing = Some(list.clone());
+                    list
+                }
+            },
+            _ => f.list.clone(),
+        };
+        let ((allocator, list), fence, event, sent) = (list, f.fence.clone(), f.event, f.sent);
         let waiting = std::time::Instant::now();
         // The flights the fetch runs behind: those in the line by now have
         // been given to the queue. On the copy queue, those landed here.
@@ -5257,6 +5311,7 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
+                    fetchguard::fetched(sent);
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so

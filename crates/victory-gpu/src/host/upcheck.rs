@@ -749,10 +749,13 @@ mod tests {
 
     /// (e) of the list in `Host::relay_card_back`'s fetch: a flight's result
     /// is fetched while the next flight is at the same bytes, which ends with
-    /// what it found. Without `VICTORY_FETCH_CHECK` title memory keeps what
-    /// was in between, and the next refresh of the 64 KiB sends it up.
+    /// what it found. Before `fetchguard` the fetch on the copy queue ran
+    /// beside that flight (12 of 12 rounds wrong without
+    /// `VICTORY_FETCH_CHECK`): title memory kept what was in between, and the
+    /// next refresh of the 64 KiB sent it up. Now the fetch goes behind it,
+    /// with or without the check.
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_FETCH_CHECK=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 (VICTORY_FETCH_CHECK=1 or not) and a process of its own"]
     fn a_result_caught_in_between_is_put_right() {
         let Some(host) = host() else {
             return;
@@ -797,7 +800,54 @@ mod tests {
             super::torn::STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect::<Vec<_>>()
         );
         assert_eq!(look(host), Some(0));
-        assert_eq!((wrong, undone), (0, 0), "without VICTORY_FETCH_CHECK=1 most are wrong");
+        assert_eq!((wrong, undone), (0, 0), "a fetch ran beside a flight writing the same bytes");
+    }
+
+    /// `fetchguard`: a flight that lands with nothing else in the air writing
+    /// its copy is fetched on the copy queue; one with a later flight in the
+    /// air at the same copy is fetched on the drawing queue, behind it, and
+    /// comes back as that flight left it, never from the middle of it.
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    fn a_fetch_never_runs_beside_a_flight_that_writes_its_copy() {
+        let Some(host) = host() else {
+            return;
+        };
+        let stats = || super::super::fetchguard::STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect::<Vec<_>>();
+        let (title, start, shadow) = title(0x5555, false);
+        let slow = Slow::new(host);
+        let alone: Vec<u8> = (0..256).map(|i| i as u8 ^ 0x5a).collect();
+        let a = host.new_list().unwrap();
+        shadow.refresh(&a, start as u64, LEN as u64);
+        shadow.gpu_writes(&a, start as u64, LEN as u64);
+        write(host, &a, &shadow, 2048, &alone);
+        a.close();
+        let before = stats();
+        host.execute_own(&a);
+        settle_now(WHY_SYNC);
+        let landed = stats();
+        assert_eq!(title[2048..2304], alone[..]);
+        assert!(landed[0] > before[0] && landed[1] == before[1], "alone, on the copy queue: {before:?} {landed:?}");
+        let (result, between) = (vec![0xc3u8; 256], vec![0u8; 256]);
+        let b = host.new_list().unwrap();
+        shadow.gpu_writes(&b, start as u64, LEN as u64);
+        write(host, &b, &shadow, 2048, &result);
+        // (Still on the card when the next is sent.)
+        slow.record(&b, 60);
+        b.close();
+        let c = host.new_list().unwrap();
+        shadow.gpu_writes(&c, start as u64, LEN as u64);
+        write(host, &c, &shadow, 2048, &between);
+        slow.record(&c, 60);
+        write(host, &c, &shadow, 2048, &result);
+        c.close();
+        host.execute_own(&b);
+        host.execute_own(&c);
+        settle_now(WHY_SYNC);
+        let after = stats();
+        assert_eq!(title[2048..2304], result[..], "what the last flight left");
+        assert!(after[1] > landed[1], "behind a flight in the air, on the drawing queue: {landed:?} {after:?}");
+        drop((a, b, c));
     }
 
     /// What nobody declared: a shader writes a piece through a view that was
