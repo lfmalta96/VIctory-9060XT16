@@ -402,7 +402,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p, REQUESTED);
+        start(p, REQUESTED, None);
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
@@ -418,10 +418,39 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
-        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+    if p.shaders.is_empty() {
+        return;
     }
+    if super::library::wanted_early(&p.key) {
+        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+        start(p, EARLY, None);
+    } else if WAITING.load(Ordering::Relaxed) < eager_limit() {
+        // XboxCompatibility T-0037 (original change, GPL-3.0-or-later): a
+        // pipeline no earlier run drew with is queued at creation too, behind
+        // requested ones, so the workers make it in parallel before its first
+        // use. Made only at first use, a loading screen that creates and uses
+        // 64 pipelines a frame waited for each in turn on its presenting
+        // thread: 24 of 24 loading frames >= 70 ms, max ~140 ms; queued at
+        // creation, none >= 70 ms, max ~45 ms (synthetic loading guest on
+        // WARP, 5 runs each, workbench/victory-runtime/loading-stall/).
+        start(p, EARLY, Some(eager_limit()));
+    }
+}
+
+/// Pipelines queued at creation by [`early`] without being on the early list.
+pub(crate) static EAGER: AtomicU64 = AtomicU64::new(0);
+
+/// Up to how many queued pipelines a new one is still queued at creation
+/// (`VICTORY_PIPELINE_EAGER`: 0 off, as before; default 256). Bounded so a
+/// title that creates thousands of pipelines it may never use does not keep
+/// every worker busy with them.
+fn eager_limit() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let limit = std::env::var("VICTORY_PIPELINE_EAGER").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256);
+        tracing::info!(limit, "pipelines queued at creation while fewer are waiting (VICTORY_PIPELINE_EAGER)");
+        limit
+    })
 }
 
 /// Whether the frame's budget is one for all threads together: a thread
@@ -558,6 +587,14 @@ impl Queue {
         self.push_as(p, priority, slow_limit() != usize::MAX && super::library::slow(&p.key))
     }
 
+    // Admission and the subsequent WAITING increment run with QUEUE locked.
+    fn push_eager(&mut self, p: &Arc<Pending>, waiting: u64, limit: u64) -> Option<bool> {
+        if waiting >= limit {
+            return None;
+        }
+        self.push(p, EARLY)
+    }
+
     fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
@@ -603,19 +640,26 @@ static AVAILABLE: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
-fn start(p: &Arc<Pending>, priority: u8) {
+fn start(p: &Arc<Pending>, priority: u8, speculative_limit: Option<u64>) {
     if p.queue_state.load(Ordering::Relaxed) >= priority {
         return;
     }
     if !workers() {
-        if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
+        if speculative_limit.is_none() && p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
             p.make();
         }
         return;
     }
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(new) = queue.push(p, priority) {
+    let admitted = match speculative_limit {
+        Some(limit) => queue.push_eager(p, WAITING.load(Ordering::Relaxed), limit),
+        None => queue.push(p, priority),
+    };
+    if let Some(new) = admitted {
         if new {
+            if speculative_limit.is_some() {
+                EAGER.fetch_add(1, Ordering::Relaxed);
+            }
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
         // (One woken could be a worker that takes passes over the screen
@@ -884,6 +928,19 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &earlier));
         assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn speculative_admission_rechecks_capacity_before_queueing() {
+        let mut queue = Queue::new();
+        let first = Arc::new(Pending::new(Vec::new(), None));
+        let second = Arc::new(Pending::new(Vec::new(), None));
+        assert_eq!(queue.push_eager(&first, 0, 0), None);
+        assert_eq!(queue.push_eager(&first, 0, 1), Some(true));
+        assert_eq!(queue.push_eager(&second, 1, 1), None);
+        assert_eq!(second.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert_eq!(queue.push(&second, REQUESTED), Some(true));
+        assert_eq!(queue.push(&first, REQUESTED), Some(false));
     }
 
     #[test]
