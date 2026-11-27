@@ -287,6 +287,11 @@ mod disk_cache {
 
     use super::{BCPACK, Request, ZLIB};
 
+    struct WriteJob {
+        key: Key,
+        data: Vec<u8>,
+    }
+
     struct Config {
         dir: PathBuf,
         max_bytes: u64,
@@ -295,7 +300,12 @@ mod disk_cache {
         misses: AtomicU64,
         hit_bytes: AtomicU64,
         stored_bytes: AtomicU64,
+        queued_bytes: AtomicU64,
+        writer: std::sync::Mutex<std::sync::mpsc::Sender<WriteJob>>,
     }
+
+    /// Cap queued background writes in RAM (256 MiB) so cold runs never spike memory.
+    const MAX_QUEUED_BYTES: u64 = 256 << 20;
 
     fn config() -> Option<&'static Config> {
         static CFG: OnceLock<Option<Config>> = OnceLock::new();
@@ -307,11 +317,16 @@ mod disk_cache {
             if mb == 0 {
                 return None;
             }
-            let base = std::env::var_os("VICTORY_CACHE_DIR")
+            let dir = std::env::var_os("VICTORY_DSTORAGE_CACHE_DIR")
+                .filter(|v| !v.is_empty())
                 .map(PathBuf::from)
-                .or_else(|| std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("victory")))
-                .unwrap_or_else(std::env::temp_dir);
-            let dir = base.join("dstorage-decompressed");
+                .unwrap_or_else(|| {
+                    let base = std::env::var_os("VICTORY_CACHE_DIR")
+                        .map(PathBuf::from)
+                        .or_else(|| std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("victory")))
+                        .unwrap_or_else(std::env::temp_dir);
+                    base.join("dstorage-decompressed")
+                });
             if std::fs::create_dir_all(&dir).is_err() {
                 return None;
             }
@@ -328,6 +343,35 @@ mod disk_cache {
                 }
             }
             let max_bytes = mb << 20;
+            let (tx, rx) = std::sync::mpsc::channel::<WriteJob>();
+            let writer_dir = dir.clone();
+            let _ = std::thread::Builder::new().name("dstorage-cache-writer".into()).spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    let len = job.data.len() as u64;
+                    let Some(cfg) = config() else { continue };
+                    let shard_dir = writer_dir.join(format!("{:02x}", job.key.shard));
+                    let _ = std::fs::create_dir_all(&shard_dir);
+                    let final_path = shard_dir.join(&job.key.name);
+                    if final_path.exists() {
+                        cfg.used_bytes.fetch_sub(len, Relaxed);
+                        cfg.queued_bytes.fetch_sub(len, Relaxed);
+                        continue;
+                    }
+                    let tmp_path = shard_dir.join(format!("{}.tmp", job.key.name));
+                    if std::fs::write(&tmp_path, &job.data).is_ok() {
+                        if std::fs::rename(&tmp_path, &final_path).is_ok() {
+                            cfg.stored_bytes.fetch_add(len, Relaxed);
+                        } else {
+                            let _ = std::fs::remove_file(&tmp_path);
+                            cfg.used_bytes.fetch_sub(len, Relaxed);
+                        }
+                    } else {
+                        let _ = std::fs::remove_file(&tmp_path);
+                        cfg.used_bytes.fetch_sub(len, Relaxed);
+                    }
+                    cfg.queued_bytes.fetch_sub(len, Relaxed);
+                }
+            });
             tracing::info!(
                 dir = %dir.display(),
                 existing_mb = existing >> 20,
@@ -342,6 +386,8 @@ mod disk_cache {
                 misses: AtomicU64::new(0),
                 hit_bytes: AtomicU64::new(0),
                 stored_bytes: AtomicU64::new(0),
+                queued_bytes: AtomicU64::new(0),
+                writer: std::sync::Mutex::new(tx),
             })
         })
         .as_ref()
@@ -441,30 +487,21 @@ mod disk_cache {
             return;
         }
         let len = data.len() as u64;
-        // Reserve capacity atomically so we never exceed `max_bytes`.
+        // Skip if background write queue is full so cold runs stay smooth and RAM stays bounded.
+        if cfg.queued_bytes.load(Relaxed).saturating_add(len) > MAX_QUEUED_BYTES {
+            return;
+        }
+        // Reserve disk capacity atomically so we never exceed `max_bytes`.
         let prev = cfg.used_bytes.fetch_add(len, Relaxed);
         if prev.saturating_add(len) > cfg.max_bytes {
             cfg.used_bytes.fetch_sub(len, Relaxed);
             return;
         }
-        let shard_dir = cfg.dir.join(format!("{:02x}", k.shard));
-        let _ = std::fs::create_dir_all(&shard_dir);
-        let final_path = shard_dir.join(&k.name);
-        if final_path.exists() {
+        cfg.queued_bytes.fetch_add(len, Relaxed);
+        let job = WriteJob { key: Key { shard: k.shard, name: k.name.clone() }, data: data.to_vec() };
+        if cfg.writer.lock().unwrap_or_else(|e| e.into_inner()).send(job).is_err() {
             cfg.used_bytes.fetch_sub(len, Relaxed);
-            return;
-        }
-        let tmp_path = shard_dir.join(format!("{}.tmp.{}", k.name, super::this_thread()));
-        if std::fs::write(&tmp_path, data).is_ok() {
-            if std::fs::rename(&tmp_path, &final_path).is_ok() {
-                cfg.stored_bytes.fetch_add(len, Relaxed);
-            } else {
-                let _ = std::fs::remove_file(&tmp_path);
-                cfg.used_bytes.fetch_sub(len, Relaxed);
-            }
-        } else {
-            let _ = std::fs::remove_file(&tmp_path);
-            cfg.used_bytes.fetch_sub(len, Relaxed);
+            cfg.queued_bytes.fetch_sub(len, Relaxed);
         }
     }
 }

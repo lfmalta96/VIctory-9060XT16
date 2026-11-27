@@ -46,9 +46,14 @@ if ($Safe) {
     # Best balance on 6-core/12-thread CPUs (Ryzen 5 5500): 5 list workers and no exclusive lane core.
     $settings.VICTORY_THIN_THREADS = '5'
     $settings.VICTORY_LANE_CORE = '0'
-    # Fast DirectStorage decompression + smooth texture streaming on 6-core/12-thread CPUs (Ryzen 5 5500).
-    $settings.VICTORY_DSTORAGE_WORKERS = '10'
+    # DirectStorage pinned to 2 physical cores (4 threads on CPUs 8-11) + 80 GB async cache on V:\ when present.
+    $settings.VICTORY_DSTORAGE_WORKERS = '4'
     $settings.VICTORY_DSTORAGE_PRIORITY = 'normal'
+    $settings.VICTORY_DSTORAGE_AFFINITY = '0xF00'
+    if (Test-Path 'V:\') {
+        $settings.VICTORY_DSTORAGE_CACHE_DIR = 'V:\dstorage-cache'
+        $settings.VICTORY_DSTORAGE_CACHE_MB = '81920'
+    }
     $settings.VICTORY_TEXTURE_STAGE_MB = '384'
     $settings.VICTORY_EARLY_TEXTURES_MS = '30'
     $settings.VICTORY_TEXTURE_STAGE_MS = '40'
