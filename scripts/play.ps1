@@ -43,8 +43,8 @@ if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
-    # Best balance on 6-core/12-thread CPUs (Ryzen 5 5500): 4 list workers and no exclusive lane core.
-    $settings.VICTORY_THIN_THREADS = '4'
+    # Best balance on 6-core/12-thread CPUs (Ryzen 5 5500): 5 list workers and no exclusive lane core.
+    $settings.VICTORY_THIN_THREADS = '5'
     $settings.VICTORY_LANE_CORE = '0'
     # Fast DirectStorage decompression + smooth texture streaming on 6-core/12-thread CPUs (Ryzen 5 5500).
     $settings.VICTORY_DSTORAGE_WORKERS = '10'
@@ -53,10 +53,12 @@ if ($Safe) {
     $settings.VICTORY_EARLY_TEXTURES_MS = '30'
     $settings.VICTORY_TEXTURE_STAGE_MS = '40'
     $settings.VICTORY_BAKE_TEXTURES_MS = '300'
-    # Renderer patches 1, 2, 5, 6 and 7 + GPU-written readback skip (WC + >=256 KiB cached, verified 0 reads by census).
+    # Renderer patches 1, 2, 5, 6 and 7 + GPU-written readback skip (WC + >=128 KiB cached) + changed-only uploads.
     $settings.VICTORY_PORT_CONSTANTS = '1'
     $settings.VICTORY_PORT_DESCRIPTORS = '1'
     $settings.VICTORY_WC_NO_BACK = '2'
+    $settings.VICTORY_SEND_CHANGED = '1'
+    $settings.VICTORY_WC_KEEP_STORES = '1'
     # Keep indirect batching enabled by default (set to '1' via -More to reduce tree/lamp flicker at ~2 fps cost).
     $settings.VICTORY_PORT_CONSTANTS_ORDER = '0'
     $settings.VICTORY_PORT_CBV = '1'
