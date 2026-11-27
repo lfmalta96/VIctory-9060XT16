@@ -504,11 +504,11 @@ pub(crate) fn ram_band(
     // 32 GB one. The free and headroom floors stay absolute: pressure is
     // pressure however big the machine is.
     let high = private * 5 >= commit_limit * 4
-        || working * 2 >= total_physical
+        || working * 5 >= total_physical * 4
         || free_physical < 2 * GIB
         || commit_headroom < GIB;
     let watch = private * 10 >= commit_limit * 7
-        || working * 4 >= total_physical
+        || working * 10 >= total_physical * 7
         || free_physical < 4 * GIB
         || commit_headroom < 2 * GIB;
     let wanted = if high {
@@ -519,11 +519,11 @@ pub(crate) fn ram_band(
         RamBand::Calm
     };
     let safe_high = private * 20 <= commit_limit * 13
-        && working * 4 <= total_physical
+        && working * 4 <= total_physical * 3
         && free_physical >= 4 * GIB
         && commit_headroom >= 3 * GIB;
     let safe_watch = private * 5 <= commit_limit * 3
-        && working * 5 <= total_physical
+        && working * 5 <= total_physical * 3
         && free_physical >= 6 * GIB
         && commit_headroom >= 3 * GIB;
     match (previous, wanted) {
@@ -6350,7 +6350,10 @@ impl Host {
             for list in runs {
                 texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
             }
-            let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
+            let writes = runs
+                .iter()
+                .flat_map(|l| std::mem::take(&mut l.deferred().writes))
+                .collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
@@ -10541,12 +10544,14 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        // SAFETY: plain creation and mapping of a CPU-visible L0 buffer;
+        // system-RAM heaps never live in bindless card-memory blocks and only
+        // run on command lists submitted after creation.
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident_buffer(),
+                    D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -10554,8 +10559,6 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident_buffer(&self.device, b)?;
-                    mapped_buffer(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10630,7 +10633,7 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        // SAFETY: plain creation and mapping of a CPU-visible buffer in card memory.
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
@@ -10696,7 +10699,10 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident_buffer(&self.device, b))).and_then(|()| mapped_buffer(&self.device));
+        // `uav_buffer`s (per-list card budgets, indirect scratch/batches, card
+        // hash buffers) are only referenced by command lists submitted after
+        // creation, so `MakeResident` suffices without stalling the copy queue.
+        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident_buffer(&self.device, b)));
         match made {
             Ok(()) => buffer,
             Err(e) => {
