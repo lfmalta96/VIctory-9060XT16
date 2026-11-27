@@ -6,7 +6,7 @@ on:
       tag:
         description: "Draft release tag to upload binaries to"
         required: false
-        default: "v0.0.5-alpha"
+        default: "v0.0.6-alpha"
   push:
     branches:
       - a-publier
@@ -38,7 +38,7 @@ jobs:
       - name: Package zip archives
         shell: pwsh
         run: |
-          $tag = if ('${{ inputs.tag }}') { '${{ inputs.tag }}' } else { 'v0.0.5-alpha' }
+          $tag = if ('${{ inputs.tag }}') { '${{ inputs.tag }}' } else { 'v0.0.6-alpha' }
           New-Item -ItemType Directory -Force -Path dist/diag/target/diag, dist/diag/scripts, dist/release/target/release, dist/release/scripts | Out-Null
           Copy-Item target/diag/victory.exe dist/diag/target/diag/victory.exe
           Copy-Item scripts/play.ps1 dist/diag/scripts/play.ps1
@@ -62,12 +62,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = if ('${{ inputs.tag }}') { '${{ inputs.tag }}' } else { 'v0.0.5-alpha' }
+          $tag = if ('${{ inputs.tag }}') { '${{ inputs.tag }}' } else { 'v0.0.6-alpha' }
           $diag = "dist/victory-$tag-diag-win64.zip"
           $rel = "dist/victory-$tag-release-win64.zip"
           gh release view $tag 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --draft --prerelease --target "${{ github.ref_name }}" --title "$tag (RDNA4 + 32GB Perf Base)" --notes "Draft privado para testes (Ryzen 5500 + 32GB + RX 9060 XT 16GB)." $diag $rel
+            gh release create $tag --draft --prerelease --target "${{ github.ref_name }}" --title "$tag (VIctory-9060XT16)" --notes "Draft privado para testes (Ryzen 5500 + 32GB + RX 9060 XT 16GB)." $diag $rel
           } else {
             gh release upload $tag $diag $rel --clobber
           }

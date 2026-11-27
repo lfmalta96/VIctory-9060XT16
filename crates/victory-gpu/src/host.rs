@@ -610,6 +610,7 @@ fn sweep() {
     if crate::residency::pressured() {
         trim_spare_chunks();
         trim_upload_pool();
+        trim_batch_buffers();
         send::trim();
         card_steps::trim();
         crate::shadow::trim_snapshots();
@@ -1475,7 +1476,7 @@ struct BatchBuf(ID3D12Resource);
 unsafe impl Send for BatchBuf {}
 
 static SPARE_BATCH: Mutex<Vec<BatchBuf>> = Mutex::new(Vec::new());
-const SPARE_BATCH_MAX: usize = 64;
+const SPARE_BATCH_MAX: usize = 256;
 
 fn take_batch_buffer(size: u64) -> Option<ID3D12Resource> {
     if let Some(BatchBuf(buf)) = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner()).pop() {
@@ -1490,7 +1491,7 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
     if buffers.is_empty() {
         return;
     }
-    let limit = if keep_freed() { SPARE_BATCH_MAX } else { 16 };
+    let limit = if keep_freed() { SPARE_BATCH_MAX } else { 128 };
     let mut overflow = Vec::new();
     {
         let mut spare = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner());
@@ -1503,6 +1504,11 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
         }
     }
     drop(overflow);
+}
+
+fn trim_batch_buffers() {
+    let dropped = std::mem::take(&mut *SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(dropped);
 }
 
 /// A host command list and its allocator, always used together.

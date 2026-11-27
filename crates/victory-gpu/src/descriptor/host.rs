@@ -5672,20 +5672,30 @@ mod tests {
         let mut q = TextureQueue::default();
         q.written(7, 1, 0, false);
         let write = q.due(1, 10)[0].1;
-        q.recheck(7, write, 2, (0x1000, 0x2000), 5, 0, 1, true);
-        assert_eq!(q.checked(7), Some((0x1000, 0x2000, 5, 0, 1, true)));
+        let first = TextureRecheck {
+            address: 0x1000,
+            bytes: 0x2000,
+            fingerprint: 5,
+            unchanged_looks: 0,
+            uploaded: 1,
+            changed_in_place: true,
+        };
+        q.recheck(7, write, 2, first, true);
+        assert_eq!(q.checked(7, write), Some((first, true)));
         assert!(q.due(1, 10).is_empty(), "due again from frame 2");
         assert_eq!(q.due(2, 10), [(7, write)], "a recheck is served");
-        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 1, 1, false);
-        assert_eq!(q.checked(7).map(|c| c.5), Some(false));
-        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 0, 1, true);
+        let second = TextureRecheck { fingerprint: 6, unchanged_looks: 1, ..first };
+        q.recheck(7, write, 3, second, false);
+        assert_eq!(q.checked(7, write).map(|c| c.1), Some(false));
+        q.recheck(7, write, 3, TextureRecheck { unchanged_looks: 0, ..second }, true);
         q.done(7, write);
-        assert_eq!(q.checked(7), None);
+        assert_eq!(q.checked(7, write), None);
         assert!(q.live.is_empty(), "a slot out of the queue is not live");
         // Another write: a fresh slot, not live, whatever it was.
         q.written(7, 4, 4, false);
-        q.recheck(7, q.due(4, 10)[0].1, 5, (0x1000, 0x2000), 6, 0, 4, false);
-        assert_eq!(q.checked(7).map(|c| c.5), Some(false));
+        let write2 = q.due(4, 10)[0].1;
+        q.recheck(7, write2, 5, TextureRecheck { uploaded: 4, unchanged_looks: 0, ..second }, false);
+        assert_eq!(q.checked(7, write2).map(|c| c.1), Some(false));
     }
 
     /// The queue of textures picked by index serves the slots looked at
@@ -5759,14 +5769,14 @@ mod tests {
             uploaded: 1,
             changed_in_place: true,
         };
-        queue.recheck(1, write, 401, checked);
+        queue.recheck(1, write, 401, checked, false);
         assert!(queue.due(400, 1).is_empty());
         assert_eq!(queue.due(401, 1), [(1, write)]);
-        assert_eq!(queue.checked(1, write), Some(checked));
+        assert_eq!(queue.checked(1, write), Some((checked, false)));
 
         queue.written(1, 402, 402, false);
         let new_write = queue.due(402, 1)[0].1;
-        queue.recheck(1, write, 801, checked);
+        queue.recheck(1, write, 801, checked, false);
         assert_eq!(queue.due(402, 1), [(1, new_write)]);
         assert_eq!(queue.checked(1, new_write), None);
     }
