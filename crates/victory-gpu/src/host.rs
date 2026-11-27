@@ -8576,14 +8576,15 @@ fn join_keys<'a>(lists: impl Iterator<Item = &'a [(usize, usize, usize, bool)]>,
 }
 
 /// [`join_keys`] of the lists' parts, with their copies.
-fn join_fronts(fronts: &[ListFront], parts: &[usize]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+fn join_fronts(fronts: Vec<ListFront>, parts: &[usize]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    let spans = join_keys(fronts.iter().map(|f| f.copies.as_slice()), parts);
     let mut shadows: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
     for front in fronts {
-        for (key, shadow) in &front.shadows {
-            shadows.entry(*key).or_insert_with(|| shadow.clone());
+        for (key, shadow) in front.shadows {
+            shadows.entry(key).or_insert(shadow);
         }
     }
-    join_keys(fronts.iter().map(|f| f.copies.as_slice()), parts)
+    spans
         .into_iter()
         .filter_map(|(key, from, to)| Some((shadows.remove(&key)?, from, to)))
         .collect()
@@ -8894,7 +8895,7 @@ impl Batch {
                     }
                 }
             }
-            let spans = join_fronts(&fronts, parts);
+            let spans = join_fronts(fronts, parts);
             self.refresh_spans(spans, due, planning);
             return;
         }

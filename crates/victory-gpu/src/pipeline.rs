@@ -447,7 +447,9 @@ pub(crate) fn bound(this: This) {
         return;
     }
     let p = pipeline(this);
-    if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if p.bound.load(std::sync::atomic::Ordering::Relaxed)
+        || p.bound.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
         return;
     }
     let frame = crate::frame::current();
