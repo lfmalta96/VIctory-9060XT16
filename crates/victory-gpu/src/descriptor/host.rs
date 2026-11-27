@@ -3145,8 +3145,14 @@ impl HostHeap {
         // A program that reads it as raw bytes reads its twin.
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
         if let Some(twin) = twin {
-            // SAFETY: a live buffer that holds the range.
-            let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
+            // SAFETY: a live buffer.
+            let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+            let offset = gpu - base;
+            let first = offset / 4;
+            // The constant buffer's size, rounded up to 256 bytes, may reach past the
+            // buffer's end: the view stops there, as `constant_raw_at`'s does (a raw
+            // view past the end removed the device on an RTX 4070: mgrein 877d5b4, 9849f04).
+            let elements = ((u64::from(desc.SizeInBytes).min(width.saturating_sub(offset)) / 4) as u32).max(1);
             let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
                 ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -3154,7 +3160,7 @@ impl HostHeap {
                 Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                     Buffer: D3D12_BUFFER_SRV {
                         FirstElement: first,
-                        NumElements: desc.SizeInBytes / 4,
+                        NumElements: elements,
                         StructureByteStride: 0,
                         Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                     },
