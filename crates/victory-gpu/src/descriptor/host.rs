@@ -3736,11 +3736,24 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
     // SAFETY: 40 bytes in the host's layout.
-    unsafe {
+    let mut desc = unsafe {
         std::ptr::from_ref(&words)
             .cast::<D3D12_SHADER_RESOURCE_VIEW_DESC>()
             .read_unaligned()
+    };
+    // The typed view format identifies the aspect of a depth-stencil
+    // texture. Use the corresponding D3D12 plane after format translation.
+    let plane = match desc.Format {
+        DXGI_FORMAT_R24_UNORM_X8_TYPELESS | DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS => 0,
+        DXGI_FORMAT_X24_TYPELESS_G8_UINT | DXGI_FORMAT_X32_TYPELESS_G8X24_UINT => 1,
+        _ => return desc,
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => desc.Anonymous.Texture2D.PlaneSlice = plane,
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => desc.Anonymous.Texture2DArray.PlaneSlice = plane,
+        _ => {}
     }
+    desc
 }
 
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -5262,6 +5275,81 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_stencil_shader_views_use_the_plane_of_the_host_format() {
+        for (guest, host, plane) in [
+            (21, 21, 0),
+            (22, 22, 1),
+            (46, 46, 0),
+            (47, 47, 1),
+            (119, 46, 0),
+            (120, 47, 1),
+        ] {
+            let words = [
+                guest,
+                D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32,
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                0,
+                3,
+                2,
+                1 - plane,
+                0,
+                0,
+                0,
+            ];
+            let desc = srv_desc(&words);
+            assert_eq!(desc.Format.0, host);
+            // SAFETY: the descriptor has the Texture2D dimension.
+            let view = unsafe { desc.Anonymous.Texture2D };
+            assert_eq!(
+                (view.MostDetailedMip, view.MipLevels, view.PlaneSlice),
+                (3, 2, plane)
+            );
+
+            let words = [
+                guest,
+                D3D12_SRV_DIMENSION_TEXTURE2DARRAY.0 as u32,
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                0,
+                3,
+                2,
+                4,
+                5,
+                1 - plane,
+                0,
+            ];
+            let desc = srv_desc(&words);
+            assert_eq!(desc.Format.0, host);
+            // SAFETY: the descriptor has the Texture2DArray dimension.
+            let view = unsafe { desc.Anonymous.Texture2DArray };
+            assert_eq!(
+                (
+                    view.MostDetailedMip,
+                    view.MipLevels,
+                    view.FirstArraySlice,
+                    view.ArraySize,
+                    view.PlaneSlice
+                ),
+                (3, 2, 4, 5, plane)
+            );
+        }
+        // A planar color SRV still uses the plane requested by the caller.
+        let color = srv_desc(&[
+            DXGI_FORMAT_R8G8_UNORM.0 as u32,
+            D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+        ]);
+        // SAFETY: the descriptor has the Texture2D dimension.
+        assert_eq!(unsafe { color.Anonymous.Texture2D.PlaneSlice }, 1);
+    }
 
     /// Every host sampler heap backs all 2,048 hardware descriptors and
     /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in
