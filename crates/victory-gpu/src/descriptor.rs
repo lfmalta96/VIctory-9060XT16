@@ -1543,10 +1543,11 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => View::Constant(u64::from(lo) | u64::from(hi) << 32, size),
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -2028,6 +2029,17 @@ mod tests {
         assert_eq!(words(at), words(other.as_ptr() as u64));
         create_cbv(null, &[0x140, 6, 512, 0], other.as_ptr() as u64);
         assert_ne!(words(at), words(other.as_ptr() as u64));
+    }
+
+    #[test]
+    fn a_null_cbv_overwrites_the_previous_descriptor() {
+        let null = std::ptr::null();
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        create_cbv(null, &[0x1000, 0, 256, 0], handle);
+        assert_eq!(view(handle), Some(View::Constant(0x1000, 256)));
+        create_cbv(null, std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Constant(0, 0)));
     }
 
     /// A released resource's views go stale; the same view of a new

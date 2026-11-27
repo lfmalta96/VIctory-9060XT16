@@ -4390,6 +4390,9 @@ fn make_twinned(
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            if address == 0 || size == 0 {
+                return None;
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if crate::port_cbv::on() {
@@ -5448,6 +5451,30 @@ mod tests {
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+    }
+
+    #[test]
+    fn null_cbvs_clear_the_host_slot_and_raw_twin() {
+        use std::sync::atomic::Ordering;
+
+        let Some(host) = host() else { return };
+        probe_view_limit();
+        let heap = HostHeap::new(false, 4).expect("a view heap on the host device");
+        let (buffer, _) = host.upload_buffer(256).expect("an upload buffer");
+        // SAFETY: the upload buffer remains alive for every descriptor write.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        for view in [View::Constant(0, 0), View::Constant(0, 256), View::Constant(0x1000, 0)] {
+            heap.constant_at(0, &buffer, gpu, 256);
+            assert!(heap.kept_in(0).is_some());
+            assert!(heap.twins.first().is_none_or(|twin| twin.load(Ordering::Relaxed)));
+            assert!(make(&view, heap.cpu(1)).is_none());
+            heap.make_at(0, &view);
+            assert!(heap.kept_in(0).is_none());
+            assert!(heap.twins.first().is_none_or(|twin| !twin.load(Ordering::Relaxed)));
+            // SAFETY: a plain device query.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        }
+        eprintln!("null CBVs exercised on the host device, raw twins: {}", !heap.twins.is_empty());
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
