@@ -496,6 +496,9 @@ pub(crate) fn sync_heaps() {
                     out.bytes += (to - from) as u64;
                     out.looked += count;
                     out.short += u64::from(!whole);
+                    if !whole {
+                        out.retry.push((from, to, check));
+                    }
                     // What was read of the changed records is in the records
                     // last seen now.
                     // SAFETY: this part's records alone, which nothing else
@@ -508,6 +511,7 @@ pub(crate) fn sync_heaps() {
                     let at = std::time::Instant::now();
                     page_bytes.resize(to - from, 0);
                     if !crate::host::read_into(from as *const u8, &mut page_bytes) {
+                        out.retry.push((from, to, check));
                         continue;
                     }
                     out.ns[0] += since(at);
@@ -587,6 +591,26 @@ pub(crate) fn sync_heaps() {
         drop(copied);
         for part in found {
             let mut part = part.into_inner().unwrap_or_else(|e| e.into_inner());
+            for (from, to, check) in part.retry {
+                if port {
+                    if check {
+                        crate::port_descriptors::asked(&[(from, to)]);
+                    }
+                    let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                    crate::port_descriptors::retry_marks(
+                        start,
+                        slots.map(|index| index as u32).filter(|&index| {
+                            !check
+                                || crate::port_descriptors::was_taken_in_check(
+                                    &taken_in_check,
+                                    index,
+                                )
+                        }),
+                    );
+                } else {
+                    written.retry(from, to);
+                }
+            }
             pages += part.pages;
             views += part.views;
             bytes += part.bytes;
@@ -713,6 +737,8 @@ struct SyncPart {
     nothing: u64,
     make: Vec<u32>,
     wait: Vec<u32>,
+    /// Dirty ranges whose read was incomplete.
+    retry: Vec<(usize, usize, bool)>,
     kinds: [u64; 5],
     /// Nanoseconds reading, comparing, sorting out ([`SYNC_JOBS_NS`]).
     ns: [u64; 3],

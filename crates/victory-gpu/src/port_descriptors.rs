@@ -176,6 +176,20 @@ fn marked(a: &Adopted, index: u32) -> bool {
     a.slots.get(index as usize).is_some_and(|s| s.load(Acquire) != 0)
 }
 
+/// Puts taken marks back when a descriptor read was incomplete.
+pub(crate) fn retry_marks(start: u64, slots: impl Iterator<Item = u32>) {
+    let adopted = ADOPTED.read().unwrap_or_else(|e| e.into_inner());
+    let Some(a) = adopted.as_ref().filter(|a| a.start == start) else {
+        return;
+    };
+    for slot in slots
+        .map(|slot| slot as usize)
+        .filter(|&slot| slot < a.count)
+    {
+        mark_slot(slot);
+    }
+}
+
 /// The marked slots of the heap at `start`, each mark cleared, as runs of
 /// slots `(first, count)`; `None` if it is not the marked heap.
 pub(crate) fn take(start: u64) -> Option<Vec<(u32, u32)>> {
@@ -624,6 +638,9 @@ mod tests {
         mark(start - 32);
         mark(start + 1000 * 32);
         assert_eq!(take(start).unwrap(), [(5, 2), (300, 1), (999, 1)]);
+        assert_eq!(take(start).unwrap(), []);
+        retry_marks(start, [5, 6, 999].into_iter());
+        assert_eq!(take(start).unwrap(), [(5, 2), (999, 1)]);
         assert_eq!(take(start).unwrap(), []);
         assert!(take(start + 32).is_none());
         let_go(start);

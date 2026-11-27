@@ -1422,6 +1422,15 @@ pub(crate) fn nothing_new_with(
 }
 
 impl Tracked {
+    /// The caller could not read all of these bytes. Keep those pages
+    /// eligible even when the next watch finds no additional writes.
+    pub(crate) fn retry(&self, from: usize, to: usize) {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        for page in from / PAGE..to.div_ceil(PAGE) {
+            seen.remove(&page);
+        }
+    }
+
     /// Takes changed pages of `[from, to)`, cut to the tracked range. A
     /// partial page stays changed so a later take can read its other bytes.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
@@ -5006,6 +5015,9 @@ mod tests {
         // (Other tests' memory was here.)
         (0..4).for_each(|page| write(page * PAGE + 5));
         assert_eq!(tracked.take(p, p + 4 * PAGE), [(p, p + 4 * PAGE)], "never taken");
+        assert!(tracked.take(p, p + 4 * PAGE).is_empty());
+        tracked.retry(p + PAGE + 4096, p + PAGE + 8192);
+        assert_eq!(tracked.take(p, p + 4 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
         assert!(tracked.take(p, p + 4 * PAGE).is_empty());
         write(PAGE + 5000);
         write(PAGE + 8192);
