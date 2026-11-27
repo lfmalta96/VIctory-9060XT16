@@ -459,11 +459,11 @@ pub(crate) struct State {
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
     /// the host list that continues this one after a cut ([`State::replay`]):
-    /// whether a topology was set, the render target and depth handles, the
+    /// whether a topology was set, the render target and depth records, the
     /// viewports, the scissors, the blend factor and the stencil reference.
     topology_set: bool,
-    target_handles: Vec<u64>,
-    depth_handle: u64,
+    target_records: Vec<crate::descriptor::RtvRecord>,
+    depth_record: Option<crate::descriptor::RtvRecord>,
     targets_set: bool,
     /// The render target views and the depth view the host list has, once
     /// it has any ([`State::set_targets`]): per view the host texture (0:
@@ -1324,16 +1324,7 @@ impl State {
     /// (25,662 times in a frame of another fork). `VICTORY_BIND_CACHE=0`
     /// sets them every time.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        self.target_handles.clear();
-        self.target_handles.extend_from_slice(handles);
-        self.depth_handle = depth;
-        self.targets_set = true;
-        self.targets.clear();
-        let mut views = Vec::with_capacity(handles.len());
-        let mut keys = Vec::with_capacity(handles.len());
+        self.target_records.clear();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1342,6 +1333,21 @@ impl State {
                 );
                 continue;
             };
+            self.target_records.push(record);
+        }
+        self.depth_record = crate::descriptor::dsv_record(depth);
+        self.targets_set = true;
+        self.bind_targets(list);
+    }
+
+    fn bind_targets(&mut self, list: &HostList) {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        self.targets.clear();
+        let mut views = Vec::with_capacity(self.target_records.len());
+        let mut keys = Vec::with_capacity(self.target_records.len());
+        for record in &self.target_records {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 // A typed null view (or a target without a host copy) still
                 // takes its slot: left out, the next live target would move
@@ -1366,7 +1372,7 @@ impl State {
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+        let dsv = self.depth_record.and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
@@ -1453,9 +1459,8 @@ impl State {
     /// draw anyway. The dynamic descriptor slots and the tables made in
     /// them stay: the parts before the cut have not run yet, and they are
     /// given back when the title's list is reset.
-    /// shortcut: the render target views are made again from the handles'
-    /// descriptors as they are now, not as they were when the title set
-    /// the targets (a descriptor rewritten in between names another view).
+    /// Render targets and depth are rebound from copies of the records
+    /// the title selected, since their original slots may have been reused.
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -1466,8 +1471,7 @@ impl State {
         }
         self.host_targets = None;
         if self.targets_set {
-            let handles = std::mem::take(&mut self.target_handles);
-            self.set_targets(list, &handles, self.depth_handle);
+            self.bind_targets(list);
         }
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);
@@ -4527,6 +4531,33 @@ mod thread_tests {
         assert_eq!(dispatch_groups([74, 1, 1], [64, 1, 1]), [2, 1, 1]);
         assert_eq!(dispatch_groups([32, 1, 1], [32, 1, 1]), [1, 1, 1]);
         assert_eq!(dispatch_groups([0, 12, 9], [64, 4, 4]), [0, 3, 3]);
+    }
+
+    #[test]
+    fn replay_uses_the_render_target_selected_before_slot_reuse() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let first = host.new_list().unwrap();
+        let next = host.new_list().unwrap();
+        let mut slot = [0u64; 16];
+        let handle = slot.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+        let mut state = State::default();
+
+        // A typed null view is enough to check the view the host binds.
+        crate::descriptor::create_rtv(null, null, &[28, 4, 0, 0, 0, 0], handle);
+        state.set_targets(&first, &[handle], 0);
+        let selected = state.host_targets.clone().unwrap();
+        assert_eq!(selected.0.len(), 1);
+        first.close();
+
+        crate::descriptor::create_rtv(null, null, &[10, 4, 0, 0, 0, 0], handle);
+        state.replay(&next);
+        assert_eq!(state.host_targets.as_ref(), Some(&selected));
+        state.set_targets(&next, &[handle], 0);
+        assert_ne!(state.host_targets.as_ref(), Some(&selected));
+        next.close();
     }
 }
 
