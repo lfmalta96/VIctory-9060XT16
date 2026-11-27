@@ -122,7 +122,7 @@ pub(crate) fn skip_back(address: usize, len: usize, carded: bool, watched: bool)
     let k0 = kind(address);
     let k1 = kind(address + len - 1);
     let wc = k0 == Kind::WriteCombined && k1 == Kind::WriteCombined;
-    let cached_large = !wc && no_back_cached() && len >= (256 << 10) && k0 == Kind::Cached && k1 == Kind::Cached;
+    let cached_large = !wc && no_back_cached() && len >= (128 << 10) && k0 == Kind::Cached && k1 == Kind::Cached;
     if !wc && !cached_large {
         return false;
     }

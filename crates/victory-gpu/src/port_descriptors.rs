@@ -487,22 +487,22 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
     // SAFETY: by the caller.
     let out = unsafe { real(to, from, n) };
     let len = MARKS.len.load(Acquire);
-    if len != 0 && n >= 4 {
+    if len != 0 && n != 0 {
         let start = MARKS.start.load(Relaxed);
         let (lo, hi) = ((to as u64).max(start), (to as u64 + n as u64).min(start + len));
         if lo < hi {
             COPIES[0].fetch_add(1, Relaxed);
-            // Each slot whose first word now lies in the copy and is a view's.
-            let mut slot = (lo - start).div_ceil(32);
+            // Each slot the copy touches whose tag word lies in the heap and is a view's.
+            let first = (lo - start) / 32;
+            let end = (hi - start).div_ceil(32).min(len.saturating_sub(4) / 32 + 1).max(first);
             let mut marked = 0;
-            while start + slot * 32 + 4 <= hi {
+            for slot in first..end {
                 let at = start + slot * 32;
-                // SAFETY: just written by the copy, inside the heap.
+                // SAFETY: inside the marked heap, at least 4 bytes before its end.
                 if unsafe { (at as *const u32).read_unaligned() } == crate::descriptor::VIEW_TAG {
                     mark_slot(slot as usize);
                     marked += 1;
                 }
-                slot += 1;
             }
             COPIES[1].fetch_add(marked, Relaxed);
         }
