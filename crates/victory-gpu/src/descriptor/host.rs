@@ -3526,8 +3526,8 @@ impl HostHeap {
     /// that is brought up to date for it).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
-        let shown = self.kept_in(index)?;
-        Some(windows::core::Interface::as_raw(&shown) == windows::core::Interface::as_raw(buffer))
+        let raw = self.kept_raw.get(index as usize)?.load(std::sync::atomic::Ordering::Acquire);
+        (raw != 0).then_some(raw == windows::core::Interface::as_raw(buffer) as usize)
     }
 
     /// What the queue of textures picked by index knows of title slot

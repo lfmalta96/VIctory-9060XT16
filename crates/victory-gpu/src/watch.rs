@@ -1366,7 +1366,22 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+/// Read guard on the write-watch journal for batching [`nothing_new_with`]
+/// checks without reacquiring the `RwLock` for every span.
+pub(crate) struct JournalGuard(std::sync::RwLockReadGuard<'static, Journal>);
+
+pub(crate) fn journal_read() -> JournalGuard {
+    JournalGuard(journal())
+}
+
+pub(crate) fn nothing_new_with(
+    j: &JournalGuard,
+    start: usize,
+    end: usize,
+    base: usize,
+    copied: &[u64],
+    ranged: u64,
+) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
@@ -1374,7 +1389,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     if known {
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
-    let j = journal();
+    let j = &j.0;
     if !known && !j.ahead.holds(first, last) {
         return false;
     }

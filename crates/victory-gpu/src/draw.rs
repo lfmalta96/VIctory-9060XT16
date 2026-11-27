@@ -501,6 +501,9 @@ pub(crate) struct State {
     /// identity (`HostHeap::id`, #392), first, count; given back when the
     /// list has run, is reset or released.
     dynamic: Vec<(usize, u64, u32, u32)>,
+    /// Per-list bump slab of pre-allocated dynamic slots: `(heap_ptr, host_id, next, rem)`
+    /// so repeated `host.dynamic()` calls avoid the global heap mutex.
+    dynamic_slab: Option<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -542,11 +545,45 @@ impl State {
         for (heap, id, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, id, first, n);
         }
+        self.dynamic_slab = None;
         self.fresh_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
+    }
+
+    /// Allocates `n` consecutive dynamic descriptor slots from this list's
+    /// local bump slab, refilling a 64-slot chunk from `host.dynamic` on miss
+    /// (falling back to exact `n` if a full chunk does not fit).
+    fn alloc_dynamic(&mut self, heap_ptr: usize, host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
+        const SLAB: u32 = 64;
+        let id = host.id();
+        if let Some((h, hid, next, rem)) = &mut self.dynamic_slab
+            && *h == heap_ptr
+            && *hid == id
+            && *rem >= n
+        {
+            let first = *next;
+            *next += n;
+            *rem -= n;
+            return Some(first);
+        }
+        let want = n.max(SLAB).min(crate::descriptor::host::DYNAMIC);
+        if let Some(base) = host.dynamic(want) {
+            self.dynamic.push((heap_ptr, id, base, want));
+            if want > n {
+                self.dynamic_slab = Some((heap_ptr, id, base + n, want - n));
+            }
+            return Some(base);
+        }
+        if want > n
+            && let Some(base) = host.dynamic(n)
+        {
+            self.dynamic.push((heap_ptr, id, base, n));
+            return Some(base);
+        }
+        None
     }
 }
 
@@ -652,7 +689,7 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Passes after which every buffer slot of the heap was looked at again.
-const HEAP_ROUND: u64 = 16;
+const HEAP_ROUND: u64 = 64;
 
 /// Whether the slots looked at again for no write are a part of them at
 /// every pass, each slot at every sixteenth (`VICTORY_HEAP_SPREAD=0`: all of
@@ -1068,20 +1105,22 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let every = *EVERY.get_or_init(|| {
         std::env::var("VICTORY_UNWATCHED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
     });
-    let mut found = Vec::with_capacity(spans.len());
+    let copies = spans.len();
+    let mut found = Vec::with_capacity(copies);
     let mut next_unwatched = std::collections::HashMap::new();
-    for (shadow, from, to) in spans.values() {
+    for (shadow, from, to) in spans.into_values() {
         if every > 1 && shadow.unwatched() {
             let id = shadow.id();
             if let Some(&(last, low, high)) = unwatched.get(&id)
-                && frame >= last && frame - last < every && low <= *from && *to <= high
+                && frame >= last && frame - last < every && low <= from && to <= high
             {
                 next_unwatched.insert(id, (last, low, high));
                 continue;
             }
-            next_unwatched.insert(id, (frame, *from, *to));
+            next_unwatched.insert(id, (frame, from, to));
         }
-        found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
+        let end = to.min(from + shadow.left(from));
+        found.push((shadow, from, end));
     }
     *unwatched = next_unwatched;
     drop(kept);
@@ -1100,7 +1139,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         tracing::info!(
             slots = slots.len(),
             views,
-            copies = spans.len(),
+            copies,
             mb = bytes >> 20,
             ms = started.elapsed().as_millis(),
             "buffer views of the heap made ready for shaders that pick them by index"
@@ -1948,12 +1987,14 @@ impl State {
             }
             Some(s)
         };
+        #[cfg(feature = "diagnostics")]
+        let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
+                crate::host::wide_write(a, len, pipeline);
                 s.gpu_writes(list, a, len);
             }
         };
@@ -1990,10 +2031,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -2061,10 +2101,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -3696,15 +3735,14 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let heap_ptr = std::ptr::from_ref(heap) as usize;
+            let Some(first) = self.alloc_dynamic(heap_ptr, host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());

@@ -48,6 +48,8 @@ pub(crate) struct Shadow {
     /// a range holds in part cannot say so in `copied`. Locked inside
     /// `copied`'s lock.
     ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// Fast-path mirror of whether `ranged` has ever been written.
+    has_ranged: std::sync::atomic::AtomicBool,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -3340,6 +3342,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
+            has_ranged: std::sync::atomic::AtomicBool::new(false),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             has_pending: std::sync::atomic::AtomicBool::new(false),
@@ -4172,6 +4175,12 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        let j = crate::watch::journal_read();
+        self.nothing_new_with(&j, address, len)
+    }
+
+    /// As [`Shadow::nothing_new`], reusing a caller-held [`crate::watch::JournalGuard`].
+    pub(crate) fn nothing_new_with(&self, j: &crate::watch::JournalGuard, address: usize, len: usize) -> bool {
         if self.place.is_some() {
             return true;
         }
@@ -4190,7 +4199,7 @@ impl Shadow {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let same = crate::watch::nothing_new_with(j, from, to, start / PAGE, &copied, self.ranged(from, to));
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4203,6 +4212,9 @@ impl Shadow {
     /// The latest asking after which a range that holds `[from, to)` was
     /// taken whole (0: none is known). The caller holds `copied`'s lock.
     fn ranged(&self, from: usize, to: usize) -> u64 {
+        if !self.has_ranged.load(Ordering::Acquire) {
+            return 0;
+        }
         let ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
         ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
     }
@@ -4354,6 +4366,7 @@ impl Shadow {
             // All of the range is in the copy as of this asking.
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
             ranged[0] = (from, to, now);
+            self.has_ranged.store(true, Ordering::Release);
             if to - from >= ranged[1].1 - ranged[1].0 {
                 ranged[1] = (from, to, now);
             }
