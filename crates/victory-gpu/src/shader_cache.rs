@@ -26,6 +26,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// The encoding of entries ([`encode`]), part of the key.
 const FORMAT: u32 = 2;
 
+/// The build fingerprint ([`build`]) that opens every cache key, in bytes.
+const BUILD_LEN: usize = 32;
+
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
@@ -83,7 +86,7 @@ pub fn stale_counts() -> (u64, u64, u64) {
 /// entries, the settings it runs with, and what it was told of the host.
 /// Not our executable: a rebuild of anything else used to translate every
 /// shader again.
-fn build() -> [u8; 32] {
+fn build() -> [u8; BUILD_LEN] {
     // The view heap's null slot differs by host GPU: a translation cached
     // without the clamp must not be served (`host_settings` below).
     crate::descriptor::host::probe_view_limit();
@@ -155,7 +158,7 @@ fn build() -> [u8; 32] {
 }
 
 /// What tells one set of translations from another ([`build`]).
-pub(crate) fn translation() -> [u8; 32] {
+pub(crate) fn translation() -> [u8; BUILD_LEN] {
     build()
 }
 
@@ -204,7 +207,15 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        // The build fingerprint [`build`] wrote; an entry that does not
+        // start with a whole one is not one of ours.
+        let container = input.get(BUILD_LEN..).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cache key of {} bytes is shorter than its {BUILD_LEN}-byte build prefix",
+                input.len()
+            )
+        })?;
+        let shader = (self.translate)(container).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader, self.source))
     }
 }
@@ -213,7 +224,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
 /// translated again (and replaced) rather than served.
 fn cached(
     cache: &Cache,
-    build: &[u8; 32],
+    build: &[u8; BUILD_LEN],
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
     refresh: bool,
@@ -224,7 +235,7 @@ fn cached(
 /// [`cached`] with the build of the translator given (`source`).
 fn cached_by(
     cache: &Cache,
-    build: &[u8; 32],
+    build: &[u8; BUILD_LEN],
     source: &str,
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
@@ -537,6 +548,20 @@ mod tests {
             }
         }
         files
+    }
+
+    /// A key without a whole build fingerprint is an ordinary error, not a
+    /// panic: the converter is what an entry that does not parse is fed.
+    #[test]
+    fn a_key_shorter_than_the_build_fingerprint_is_an_error() {
+        let translate = |_: &[u8]| -> Result<HostShader, String> { Ok(shader()) };
+        let converter = Translate {
+            translate,
+            source: "build",
+            ran: AtomicBool::new(false),
+        };
+        let error = converter.convert(b"short").unwrap_err();
+        assert!(error.to_string().contains("shorter"), "{error}");
     }
 
     #[test]
