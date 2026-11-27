@@ -56,11 +56,34 @@ struct Entry {
 struct Store {
     folder: PathBuf,
     index: Mutex<HashMap<Key, Entry>>,
-    kept: Mutex<HashMap<u128, Arc<Vec<u8>>>>,
-    kept_bytes: AtomicU64,
+    kept: Mutex<Kept>,
     jobs: Mutex<mpsc::Sender<Job>>,
     /// Contents given to it this run (digests of whole textures).
     seen: Mutex<std::collections::HashSet<u128>>,
+}
+
+/// The resident cache and its byte count share one lock: checking space,
+/// deduplicating a blob and charging its bytes are one operation.
+#[derive(Default)]
+struct Kept {
+    blobs: HashMap<u128, Arc<Vec<u8>>>,
+    bytes: u64,
+}
+
+impl Kept {
+    fn insert(&mut self, blob: u128, bytes: Arc<Vec<u8>>, limit: u64) {
+        if self.blobs.contains_key(&blob) {
+            return;
+        }
+        let Some(total) = self.bytes.checked_add(bytes.len() as u64) else {
+            return;
+        };
+        if total > limit {
+            return;
+        }
+        self.blobs.insert(blob, bytes);
+        self.bytes = total;
+    }
 }
 
 /// Since the start: entries found at startup, textures kept, keys asked,
@@ -139,8 +162,7 @@ fn store() -> Option<&'static Store> {
             Some(Store {
                 folder,
                 index: Mutex::new(index),
-                kept: Mutex::new(HashMap::new()),
-                kept_bytes: AtomicU64::new(0),
+                kept: Mutex::new(Kept::default()),
                 jobs: Mutex::new(send),
                 seen: Mutex::new(std::collections::HashSet::new()),
             })
@@ -225,10 +247,7 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
             index.insert(*k, *e);
         }
     }
-    if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
-        store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
-        store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(blob, bytes.clone());
-    }
+    store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(blob, bytes.clone(), KEPT);
     STATS[1].fetch_add(1, Relaxed);
     Some((blob, bytes, entries))
 }
@@ -244,16 +263,13 @@ pub(crate) fn find(shape: Shape, level: u32, smaller: &[u8]) -> Option<Arc<Vec<u
     if entry.levels != level {
         return None;
     }
-    let kept = store.kept.lock().unwrap_or_else(|e| e.into_inner()).get(&entry.blob).cloned();
+    let kept = store.kept.lock().unwrap_or_else(|e| e.into_inner()).blobs.get(&entry.blob).cloned();
     let bytes = match kept {
         Some(bytes) => bytes,
         None => {
             let bytes = Arc::new(std::fs::read(store.folder.join(format!("{:032x}.lv", entry.blob))).ok()?);
             STATS[4].fetch_add(1, Relaxed);
-            if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
-                store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
-                store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(entry.blob, bytes.clone());
-            }
+            store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(entry.blob, bytes.clone(), KEPT);
             bytes
         }
     };
@@ -270,7 +286,7 @@ pub(crate) fn line() -> Option<String> {
          ({} MB written, {} MB held in memory), {asked} first views from a smaller level asked, {found} found ({read} read \
          from the folder), {} host copies made whole from it",
         written >> 20,
-        store.kept_bytes.load(Relaxed) >> 20,
+        store.kept.lock().unwrap_or_else(|e| e.into_inner()).bytes >> 20,
         PREFILLED.load(Relaxed)
     ))
 }
@@ -281,6 +297,52 @@ pub(crate) static PREFILLED: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_cache_charges_each_blob_once_and_respects_limit() {
+        let mut kept = Kept::default();
+        let first = Arc::new(vec![1; 6]);
+        kept.insert(1, first.clone(), 10);
+        kept.insert(1, Arc::new(vec![2; 6]), 10);
+        assert_eq!(kept.bytes, 6);
+        assert!(Arc::ptr_eq(&kept.blobs[&1], &first));
+        kept.insert(2, Arc::new(vec![3; 5]), 10);
+        assert!(!kept.blobs.contains_key(&2));
+        kept.insert(3, Arc::new(vec![4; 4]), 10);
+        assert_eq!(kept.bytes, 10);
+        assert_eq!(kept.blobs.len(), 2);
+        kept.insert(4, Arc::new(vec![0; 1]), 10);
+        assert_eq!(kept.blobs.len(), 2);
+        let mut disabled = Kept::default();
+        disabled.insert(1, first, 0);
+        assert!(disabled.blobs.is_empty());
+    }
+
+    #[test]
+    fn concurrent_resident_admissions_cannot_exceed_budget() {
+        let kept = Mutex::new(Kept::default());
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for id in 0..8u128 {
+                let kept = &kept;
+                let start = &start;
+                scope.spawn(move || {
+                    let bytes = Arc::new(vec![0; 4]);
+                    start.wait();
+                    // Two threads offer each blob, but only two unique
+                    // blobs fit. Admission must count each at most once.
+                    kept.lock().unwrap().insert(id % 4, bytes, 8);
+                });
+            }
+        });
+        let kept = kept.into_inner().unwrap();
+        assert_eq!(kept.bytes, 8);
+        assert_eq!(kept.blobs.len(), 2);
+        assert_eq!(
+            kept.bytes,
+            kept.blobs.values().map(|b| b.len() as u64).sum::<u64>()
+        );
+    }
 
     #[test]
     fn index_lines_read_back() {
