@@ -5787,8 +5787,15 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        // Offload landed HostList resets/drops to `victory-late-wait` so the
+        // critical submitting thread never blocks on D3D12 allocation teardown.
+        {
+            let mut line = line();
+            if line.landed.len() > bury_lag() as usize {
+                line.poke = true;
+                LINE_MOVED.notify_one();
+            }
+        }
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a

@@ -243,7 +243,40 @@ const IDLE_MOST_BYTES: u64 = 256 << 20;
 
 #[cfg(windows)]
 fn idle_most() -> usize {
-    if crate::residency::limited_host_ram() { 320 } else { 512 }
+    if crate::residency::limited_host_ram() { 384 } else { 512 }
+}
+
+#[cfg(windows)]
+static POOL_STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+// 0=reused, 1=not_in_ran, 2=retired, 3=full_count, 4=full_bytes, 5=fresh_hit, 6=fresh_miss, 7=trim_dropped
+
+#[cfg(windows)]
+fn maybe_log_pool_stats() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::{Duration, Instant};
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    {
+        let Ok(mut last) = LAST.try_lock() else {
+            return;
+        };
+        let now = Instant::now();
+        if last.is_some_and(|prev| now.duration_since(prev) < Duration::from_secs(5)) {
+            return;
+        }
+        *last = Some(now);
+    }
+    let s: [u64; 8] = std::array::from_fn(|i| POOL_STATS[i].swap(0, Relaxed));
+    if s.iter().all(|&v| v == 0) {
+        return;
+    }
+    let (idle_len, idle_bytes) = {
+        let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        (idle.0.len(), idle.1)
+    };
+    tracing::info!(
+        "host list pool (5s): fresh hit={} miss={}, recycle reused={} drop(not_in_ran={} retired={} full_count={} full_bytes={}), trim_dropped={}, idle={}/{} ({:.1} MiB)",
+        s[5], s[6], s[0], s[1], s[2], s[3], s[4], s[7], idle_len, idle_most(), idle_bytes as f64 / 1_048_576.0
+    );
 }
 
 /// Whether host lists that have run are used again (on by default;
@@ -267,8 +300,14 @@ fn fresh_list() -> Option<crate::host::HostList> {
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        Some(Idle(list, _)) => {
+            POOL_STATS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(list)
+        }
+        None => {
+            POOL_STATS[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::host::host().and_then(|h| h.new_list().ok())
+        }
     }
 }
 
@@ -284,6 +323,9 @@ pub(crate) fn trim_idle(keep: usize) {
             }
         }
     }
+    if !dropped.is_empty() {
+        POOL_STATS[7].fetch_add(dropped.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
     drop(dropped);
 }
 
@@ -296,12 +338,22 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
+    use std::sync::atomic::Ordering::Relaxed;
     let max_idle = idle_most();
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || host.should_retire() || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= max_idle {
+        if !ran.contains(&i) {
+            POOL_STATS[1].fetch_add(1, Relaxed);
+            continue;
+        }
+        if host.should_retire() {
+            POOL_STATS[2].fetch_add(1, Relaxed);
+            continue;
+        }
+        if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= max_idle {
+            POOL_STATS[3].fetch_add(1, Relaxed);
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -309,11 +361,17 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < max_idle && idle.1 + bytes <= IDLE_MOST_BYTES {
+        if idle.0.len() >= max_idle {
+            POOL_STATS[3].fetch_add(1, Relaxed);
+        } else if idle.1 + bytes > IDLE_MOST_BYTES {
+            POOL_STATS[4].fetch_add(1, Relaxed);
+        } else {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
+            POOL_STATS[0].fetch_add(1, Relaxed);
         }
     }
+    maybe_log_pool_stats();
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -612,13 +670,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        host: if !thin { fresh_list() } else { None },
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
