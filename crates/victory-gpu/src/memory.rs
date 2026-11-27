@@ -752,6 +752,20 @@ impl Memory {
         }
     }
 
+    /// Only the directory and arena copies that [`Memory::land`] can write to
+    /// are refreshed after deferred `land` calls, avoiding redundant refreshes
+    /// of unrelated title buffers under `MEMORY.lock()`.
+    fn bring_up_arenas(&self, list: &HostList) {
+        let (start, len) = self.directory.1.span();
+        self.directory.1.refresh(list, start, len);
+        for &(n, _) in &self.arenas {
+            if let Some(shadow) = self.copies.get(n) {
+                let (start, len) = shadow.span();
+                shadow.refresh(list, start, len);
+            }
+        }
+    }
+
     /// Every ten seconds or so, what was used.
     fn report(&mut self) {
         let now = std::time::Instant::now();
@@ -956,6 +970,7 @@ pub(crate) fn ready(
         }
     }
     let mut came = [held(m) - before, 0, 0, 0];
+    let mut to_land: Vec<u64> = Vec::new();
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
         // (Several structures to a page.)
         let mut packed = false;
@@ -979,12 +994,7 @@ pub(crate) fn ready(
                 }
                 m.bring(at / PAGE, (at + len - 1) / PAGE + 1);
             }
-            list.defer_host(move || {
-                if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                    m.land(at);
-                }
-            });
-            m.bring_up(list);
+            to_land.push(at);
         }
         if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
@@ -1021,6 +1031,16 @@ pub(crate) fn ready(
                 came[2] += held(m).saturating_sub(before);
             }
         }
+    }
+    if !to_land.is_empty() {
+        list.defer_host(move || {
+            if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                for &at in &to_land {
+                    m.land(at);
+                }
+            }
+        });
+        m.bring_up_arenas(list);
     }
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;

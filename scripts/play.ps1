@@ -43,21 +43,21 @@ if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
-    # Best balance on 6-core/12-thread CPUs (Ryzen 5 5500): 5 list workers and no exclusive lane core.
-    $settings.VICTORY_THIN_THREADS = '5'
+    # Best balance on 6-core/12-thread CPUs (Ryzen 5 5500): 4 list workers and no exclusive lane core.
+    $settings.VICTORY_THIN_THREADS = '4'
     $settings.VICTORY_LANE_CORE = '0'
-    # DirectStorage pinned to 1 physical core (8 I/O threads on CPUs 10-11 for QD8 SSD reads, freeing 5 cores for game/thin) + 80 GB pack cache on V:\.
-    $settings.VICTORY_DSTORAGE_WORKERS = '8'
+    # DirectStorage pinned to 2 physical cores (CPUs 8-11) directly from NVMe (no SATA SSD disk cache).
+    $settings.VICTORY_DSTORAGE_WORKERS = '4'
     $settings.VICTORY_DSTORAGE_PRIORITY = 'normal'
-    $settings.VICTORY_DSTORAGE_AFFINITY = '0xC00'
-    if (Test-Path 'V:\') {
-        $settings.VICTORY_DSTORAGE_CACHE_DIR = 'V:\dstorage-cache'
-        $settings.VICTORY_DSTORAGE_CACHE_MB = '81920'
-    }
-    $settings.VICTORY_TEXTURE_STAGE_MB = '384'
-    $settings.VICTORY_EARLY_TEXTURES_MS = '30'
-    $settings.VICTORY_TEXTURE_STAGE_MS = '40'
-    $settings.VICTORY_BAKE_TEXTURES_MS = '300'
+    $settings.VICTORY_DSTORAGE_AFFINITY = '0xF00'
+    # Fast texture streaming: re-check waiting slots every 200 ms (eliminates 17-32 s pop-in) + aggressive early staging.
+    $settings.VICTORY_TEXTURE_LOOK_MS = '200'
+    $settings.VICTORY_TEXTURE_STAGE_MB = '512'
+    $settings.VICTORY_EARLY_TEXTURES_MS = '100'
+    $settings.VICTORY_TEXTURE_STAGE_MS = '50'
+    $settings.VICTORY_BAKE_TEXTURES_MS = '400'
+    # Skip pointless GPU drains on upload-memory fills touching pages untouched by shaders for 600 frames.
+    $settings.VICTORY_FILL_TITLE = '2'
     # Renderer patches 1, 2, 5, 6 and 7 + GPU-written readback skip (WC + >=128 KiB cached) + changed-only uploads.
     $settings.VICTORY_PORT_CONSTANTS = '1'
     $settings.VICTORY_PORT_DESCRIPTORS = '1'

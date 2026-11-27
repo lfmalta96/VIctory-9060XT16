@@ -2564,16 +2564,12 @@ impl State {
         // half a frame per second, while the title streams by the clock.
         // (About a second before the runtime told of the memory it maps:
         // the looks are now only for what that does not tell.)
-        static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
-        let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        // (`took` is since the last pass, of any heap and list: several a
-        // frame, so this was often 256 frames, 13-18 s at 14-20 frames a
-        // second; `VICTORY_TEXTURE_LOOK_MS` counts by the frame's time.)
-        let most = match look_ms() {
-            Some(ms) => (ms / frame_ms(frame, now)).clamp(1, 256),
-            None => (4000 / took).clamp(16, 256),
-        };
+        // Use frame duration (default 500 ms ceiling; `VICTORY_TEXTURE_LOOK_MS` overrides)
+        // instead of inter-pass time, which clamped to 256 frames (18-50 s) when multiple
+        // passes ran in one frame.
+        let look = look_ms().unwrap_or(500);
+        let most = (look / frame_ms(frame, now)).clamp(1, 256);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
