@@ -267,7 +267,12 @@ impl HostList {
                     };
                     unsafe {
                         self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
-                        self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        // The host copy was promoted to a copy's source: back
+                        // to common, to be promoted to its destination.
+                        self.list.ResourceBarrier(&[
+                            transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                            transition(&from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                        ]);
                         wait_for_all(host, &self.list);
                         self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
                     }
@@ -281,7 +286,15 @@ impl HostList {
             },
             (None, None) => return false,
         }
-        unsafe { wait_for_all(host, &self.list) };
+        // The destination was promoted to a copy's destination, a write
+        // state: no use after it in the list (the draws' root views read it,
+        // issue #350) could promote it again. Back to common, as the
+        // submission's lists expect the host copies.
+        // SAFETY: an open list; a live buffer.
+        unsafe {
+            self.list.ResourceBarrier(&[transition(&to.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+            wait_for_all(host, &self.list);
+        }
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
@@ -331,6 +344,168 @@ impl HostList {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Title memory of `len` bytes with a host copy (not in place).
+    fn title_of(resource: usize, len: usize) -> (&'static mut [u8], usize, std::sync::Arc<Shadow>) {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: memory of our own, never freed.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | WRITE_WATCH, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!base.is_null());
+        crate::shadow::register(resource, base as u64, len as u64);
+        let shadow = crate::shadow::find(base as u64, 64).expect("a copy");
+        assert!(!shadow.in_place());
+        // SAFETY: `len` bytes just committed.
+        (unsafe { std::slice::from_raw_parts_mut(base, len) }, base as usize, shadow)
+    }
+
+    /// What the debug layer said (id, text), as it says it: the host's own
+    /// reading of its queue at each submission empties the queue.
+    static SAID: Mutex<Vec<(i32, String)>> = Mutex::new(Vec::new());
+
+    unsafe extern "system" fn heard(
+        _: D3D12_MESSAGE_CATEGORY,
+        _: D3D12_MESSAGE_SEVERITY,
+        id: D3D12_MESSAGE_ID,
+        text: windows::core::PCSTR,
+        _: *mut core::ffi::c_void,
+    ) {
+        // SAFETY: the layer's text, alive through the call.
+        let text = unsafe { text.to_string() }.unwrap_or_default();
+        SAID.lock().unwrap_or_else(|e| e.into_inner()).push((id.0, text));
+    }
+
+    /// Listens to the debug layer from now on; `false` without it.
+    fn listen(host: &Host) -> bool {
+        let Some(queue) = host.messages.as_ref().and_then(|q| q.cast::<ID3D12InfoQueue1>().ok()) else {
+            return false;
+        };
+        let mut cookie = 0;
+        // SAFETY: a function that lives as long as the process.
+        unsafe { queue.RegisterMessageCallback(Some(heard), D3D12_MESSAGE_CALLBACK_FLAG_NONE, std::ptr::null_mut(), &mut cookie) }.is_ok()
+    }
+
+    /// What the debug layer said since the last call.
+    fn messages() -> Vec<(i32, String)> {
+        std::mem::take(&mut *SAID.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Reads at `read` as a root shader resource and writes at `write` as a
+    /// root unordered access view, as draws of the list do.
+    const ROOT_VIEWS: &str = r#"
+#define RS "SRV(t0), UAV(u0)"
+ByteAddressBuffer from : register(t0);
+RWByteAddressBuffer to : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { to.Store(0, from.Load(0) + 1u); }
+"#;
+
+    /// Issue #350: a copy at its place leaves its buffers where later root
+    /// views of the same list can take them (the debug layer said
+    /// "Resource state (0x400: COPY_DEST) (promoted from COMMON state) ... is
+    /// invalid for use as a root shader resource", id 538). Out of upload
+    /// memory, out of another host copy, within one; in the card's memory
+    /// and in the PC's. A diagnostics build with the debug layer:
+    /// `VICTORY_D3D12_DEBUG=1 cargo test -p victory-gpu --features diagnostics
+    /// --lib copies_in_place_leave -- --ignored`.
+    #[test]
+    #[ignore = "wants a diagnostics build, VICTORY_D3D12_DEBUG=1 and a process of its own"]
+    fn copies_in_place_leave_their_buffers_to_root_views() {
+        let Some(host) = super::host() else {
+            return; // no host GPU
+        };
+        assert!(listen(host), "a diagnostics build with VICTORY_D3D12_DEBUG=1");
+        assert!(on(), "copies at their place");
+        let code = compile(ROOT_VIEWS, windows::core::s!("main"), windows::core::s!("cs_5_1")).unwrap();
+        // SAFETY: the code lives through the calls; the root signature is in it.
+        let (root, pso) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        let out = host.uav_buffer(1 << 16).unwrap();
+        let dispatch = |list: &HostList, read: u64, write: u64| {
+            // SAFETY: an open list; live buffers.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootShaderResourceView(0, read);
+                list.list.SetComputeRootUnorderedAccessView(1, write);
+                list.list.Dispatch(1, 1, 1);
+            }
+        };
+        // (In the card's memory from 4 MiB on, on a 16 GB card: the compare
+        // that follows the lists in the same call reads what shaders and
+        // these copies wrote as a root shader resource.)
+        let mut resource = 0x3500;
+        let mut wrong = Vec::new();
+        for len in [256usize << 10, 8 << 20] {
+            for case in 0..4 {
+                let _ = messages();
+                let compares = CARD_PASSES[2].load(Ordering::Relaxed);
+                let (title, start, to) = title_of(resource, len);
+                let (other, other_start, from) = title_of(resource + 1, len);
+                resource += 2;
+                title[..64].fill(1);
+                other[..64].fill(2);
+                let list = host.new_list().unwrap();
+                match case {
+                    // Out of upload memory: the title's CPU wrote the source.
+                    0 => assert!(list.place_copy(start + 4096, start, 64)),
+                    // Out of another host copy, which a shader writes.
+                    1 => {
+                        from.refresh(&list, other_start as u64, 64);
+                        from.gpu_writes(&list, other_start as u64, 64);
+                        assert!(list.place_copy(start + 4096, other_start, 64));
+                    }
+                    // Within one host copy that a shader writes.
+                    2 => {
+                        to.refresh(&list, start as u64, 64);
+                        to.gpu_writes(&list, start as u64, 64);
+                        assert!(list.place_copy(start + 4096, start, 64));
+                    }
+                    // As 0, and nothing of the list reads it after: only the
+                    // compare does, for a copy in the card's memory.
+                    _ => assert!(list.place_copy(start + 4096, start, 64)),
+                }
+                // As a draw's root view does (`VICTORY_ROOT_SRV_DIRECT=1`).
+                if case < 3 {
+                    dispatch(&list, to.gpu((start + 4096) as u64), out_gpu(&out));
+                }
+                list.close();
+                host.execute(&[&list]);
+                let said = messages();
+                let carded = to.carded();
+                let compared = CARD_PASSES[2].load(Ordering::Relaxed) - compares;
+                eprintln!("{len:#x} case {case}: carded {carded}, compares {compared}, {} messages", said.len());
+                for (id, text) in &said {
+                    eprintln!("{len:#x} case {case} (carded {carded}, compares {compared}): D3D12 {id}: {text}");
+                }
+                if !said.is_empty() {
+                    wrong.push((len, case, said.len()));
+                }
+                assert_eq!(title[4096], if case == 1 { 2 } else { 1 }, "the copy's bytes");
+            }
+        }
+        assert_eq!(wrong, Vec::new(), "(bytes, case, messages) the debug layer spoke of");
+    }
+
+    fn out_gpu(out: &ID3D12Resource) -> u64 {
+        // SAFETY: a live buffer.
+        unsafe { out.GetGPUVirtualAddress() }
+    }
     /// What copies with two sides cost to make (ignored: a measurement for
     /// `VICTORY_CARD_ALL`): buffers of 64 KiB on the card and in the PC's
     /// memory.
