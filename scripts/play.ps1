@@ -46,18 +46,24 @@ if ($Safe) {
     # Best balance on 6-core/12-thread CPUs (Ryzen 5 5500): 4 list workers and no exclusive lane core.
     $settings.VICTORY_THIN_THREADS = '4'
     $settings.VICTORY_LANE_CORE = '0'
-    # Keep DirectStorage CPU decompression from starving frame-critical threads during bursts.
-    $settings.VICTORY_DSTORAGE_WORKERS = '4'
-    $settings.VICTORY_DSTORAGE_PRIORITY = 'below'
-    # Renderer patches 1, 5, 6 and 7 (patch 2 / PORT_DESCRIPTORS left off: misses draw-table writers).
+    # Fast DirectStorage decompression + smooth texture streaming on 6-core/12-thread CPUs (Ryzen 5 5500).
+    $settings.VICTORY_DSTORAGE_WORKERS = '10'
+    $settings.VICTORY_DSTORAGE_PRIORITY = 'normal'
+    $settings.VICTORY_TEXTURE_STAGE_MB = '256'
+    $settings.VICTORY_EARLY_TEXTURES_MS = '30'
+    $settings.VICTORY_TEXTURE_STAGE_MS = '40'
+    $settings.VICTORY_BAKE_TEXTURES_MS = '300'
+    # Renderer patches 1, 2, 5, 6 and 7 + write-combined readback skip.
     $settings.VICTORY_PORT_CONSTANTS = '1'
+    $settings.VICTORY_PORT_DESCRIPTORS = '1'
+    $settings.VICTORY_WC_NO_BACK = '1'
     # Keep indirect batching enabled by default (set to '1' via -More to reduce tree/lamp flicker at ~2 fps cost).
     $settings.VICTORY_PORT_CONSTANTS_ORDER = '0'
     $settings.VICTORY_PORT_CBV = '1'
     $settings.VICTORY_PORT_GUARD = '1'
     $settings.VICTORY_PORT_JOURNAL = '1'
-    # Offload >=1 MiB buffer comparisons to GPU.
-    $settings.VICTORY_CARD_BUFFERS_MIN_MB = '1'
+    # Offload >=512 KiB buffer comparisons to GPU (sweet spot with VICTORY_WC_NO_BACK=1).
+    $settings.VICTORY_CARD_BUFFERS_MIN_KB = '512'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }

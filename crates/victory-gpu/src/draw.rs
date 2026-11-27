@@ -1097,11 +1097,11 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             last_range.1 = last_range.1.max(*to);
             continue;
         }
-        if last_key != 0 {
-            if let Some(span) = spans.get_mut(&last_key) {
-                span.1 = span.1.min(last_range.0);
-                span.2 = span.2.max(last_range.1);
-            }
+        if last_key != 0
+            && let Some(span) = spans.get_mut(&last_key)
+        {
+            span.1 = span.1.min(last_range.0);
+            span.2 = span.2.max(last_range.1);
         }
         let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
         span.1 = span.1.min(*from);
@@ -1109,11 +1109,11 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         last_key = key;
         last_range = (span.1, span.2);
     }
-    if last_key != 0 {
-        if let Some(span) = spans.get_mut(&last_key) {
-            span.1 = span.1.min(last_range.0);
-            span.2 = span.2.max(last_range.1);
-        }
+    if last_key != 0
+        && let Some(span) = spans.get_mut(&last_key)
+    {
+        span.1 = span.1.min(last_range.0);
+        span.2 = span.2.max(last_range.1);
     }
     let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.

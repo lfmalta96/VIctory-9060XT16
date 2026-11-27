@@ -2613,12 +2613,14 @@ impl HostHeap {
             return;
         }
         // Once per slot and frame: tables are read by every draw.
-        if old != now | TABLED_READ && stamp.swap(now | TABLED_READ, Relaxed) != now | TABLED_READ {
-            if tabled_out() && self.queued.may(index) {
-                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.take_out(index) {
-                    TABLED_WRITES[1].fetch_add(1, Relaxed);
-                }
+        if old != now | TABLED_READ
+            && stamp.swap(now | TABLED_READ, Relaxed) != now | TABLED_READ
+            && tabled_out()
+            && self.queued.may(index)
+        {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            if textures.take_out(index) {
+                TABLED_WRITES[1].fetch_add(1, Relaxed);
             }
         }
     }
